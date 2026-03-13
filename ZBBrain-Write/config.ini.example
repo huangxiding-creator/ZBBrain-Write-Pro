@@ -1,0 +1,104 @@
+# ============================================================
+# ZBBrain-Write 配置文件示例
+# EPC总承包微信公众号自动化文章生成工具
+# 使用前请复制为 config.ini 并填入真实凭证
+# ============================================================
+
+[搜狗微信搜索]
+搜狗微信搜索网址 = https://www.sogou.com/sogou?query=EPC%E6%80%BB%E6%89%BF%E5%8C%85&ie=utf8
+默认搜索关键词 = EPC总承包
+关键词轮换状态文件 = ./keyword_rotation.json
+默认翻页页数 = 5
+最大翻页页数 = 10
+
+[总包大脑]
+总包大脑网址 = https://metaso.cn/s/YOUR_SHARE_ID
+用户数据目录 = ./browser_data
+最大等待回复时间 = 600
+回复检查间隔 = 5
+
+[智谱AI]
+api key = YOUR_ZHIPU_API_KEY
+api 地址 = https://open.bigmodel.cn/api/paas/v4/chat/completions
+低成本模型名称 = glm-4-plus
+高质量模型名称 = glm-4-plus
+图片生成模型 = cogview-3-flash
+问题最小字符数 = 50
+回复最小字符数 = 500
+
+[微信公众号]
+appid = YOUR_WECHAT_APPID
+appsecret = YOUR_WECHAT_APPSECRET
+封面图片路径 = ./cover.jpg
+默认作者 = 总包大脑
+声明原创 = 1
+开启评论 = 1
+
+[工程豹公众号]
+appid = YOUR_GCB_APPID
+secret = YOUR_GCB_SECRET
+
+[总包说公众号]
+appid = YOUR_ZBS_APPID
+secret = YOUR_ZBS_SECRET
+
+[文章主题]
+默认主题 = 秋日暖光
+启用主题轮换 = true
+主题轮换状态文件 = ./theme_rotation.json
+
+秋日暖光描述 = 温暖治愈，橙色调，文艺美学
+春日清新描述 = 清新自然，绿色调，生机盎然
+深海静谧描述 = 深沉冷静，蓝色调，专业稳重
+优雅金描述 = 高端大气，金色调，品质感
+活力红描述 = 活力热情，红色调，冲击力
+简约蓝描述 = 简约现代，蓝色调，科技感
+专注绿描述 = 专注沉稳，绿色调，清新感
+
+[广告图设置]
+显示顶部广告图 = true
+顶部广告图路径 = ./image/top-ad.jpg
+显示底部广告图 = true
+底部广告图路径 = ./image/bottom-image.jpg
+
+[任务调度]
+启用定时任务 = true
+运行间隔小时 = 2
+停止运行小时 = 22
+开始运行小时 = 6
+
+[企业微信通知]
+Webhook地址 = https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=YOUR_WEBHOOK_KEY
+
+[邮件通知]
+接收邮箱 = YOUR_EMAIL@qq.com
+SMTP服务器 = smtp.qq.com
+SMTP端口 = 587
+发件邮箱 = YOUR_EMAIL@qq.com
+授权码 = YOUR_SMTP_AUTH_CODE
+
+[其他]
+日志文件路径 = ./zbbrain_article.log
+临时文件目录 = ./temp
+调试模式 = false
+最多重试次数 = 5
+
+[AI提示词-热点问题]
+系统角色 = 你是一位资深的EPC总承包行业专家
+用户提示词 = {articles_context}
+
+[AI提示词-爆款标题]
+系统角色 = 你是公众号爆款标题大师
+用户提示词 = {question} {content}
+
+[AI提示词-内容结构化]
+系统角色 = 你是专业的排版编辑
+用户提示词 = {content}
+
+[AI提示词-封面图片]
+系统角色 = 你是专业的商业插画师
+用户提示词 = {question} {answer}
+
+[AI提示词-HTML排版]
+系统角色模板 = 你是专业的微信公众号排版设计师
+用户提示词 = {md_content}
