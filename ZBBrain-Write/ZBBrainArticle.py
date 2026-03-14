@@ -8463,6 +8463,37 @@ ZBBrainArticle 自动化脚本
         except Exception as e:
             self.logger.error(f"发送邮件通知失败: {str(e)}")
 
+    def send_custom_message(self, content: str):
+        """发送自定义消息到企业微信（v3.5.0 新增）
+
+        Args:
+            content: Markdown格式的消息内容
+        """
+        self.logger.info("发送自定义通知消息")
+
+        # 发送到企业微信
+        if self.config.wechat_webhook:
+            try:
+                data = {
+                    "msgtype": "markdown",
+                    "markdown": {
+                        "content": content
+                    }
+                }
+                response = requests.post(
+                    self.config.wechat_webhook,
+                    json=data,
+                    timeout=30
+                )
+                if response.status_code == 200:
+                    self.logger.info("✓ 企业微信自定义消息发送成功")
+                else:
+                    self.logger.error(f"企业微信消息发送失败: {response.text}")
+            except Exception as e:
+                self.logger.error(f"发送企业微信消息失败: {str(e)}")
+        else:
+            self.logger.warning("未配置企业微信webhook，跳过发送")
+
     def send_status_report(self, stats: dict):
         """发送运行状态汇报（定时汇报功能）
 
@@ -8480,10 +8511,14 @@ ZBBrainArticle 自动化脚本
         """
         self.logger.info("发送定时运行状态汇报")
 
-        # 计算运行时长
+        # 计算运行时长（使用北京时间，确保时区一致）
         from datetime import datetime
-        start_dt = datetime.fromisoformat(stats.get('start_time', datetime.now().isoformat()))
-        now = datetime.now()
+        now = datetime.now(beijing_tz)
+        start_time_str = stats.get('start_time', now.isoformat())
+        start_dt = datetime.fromisoformat(start_time_str)
+        # 如果start_dt有时区信息，转换为北京时间；如果没有，假设为本地时间
+        if start_dt.tzinfo is not None:
+            start_dt = start_dt.astimezone(beijing_tz)
         uptime_hours = (now - start_dt).total_seconds() / 3600
 
         # 构建状态信息
@@ -8577,6 +8612,91 @@ class ZBBrainArticleTask:
         """初始化任务"""
         self.config = Config(config_file)
         self.logger = Logger(self.config.log_file_path, self.config.debug_mode)
+
+    def _check_china_network(self) -> tuple:
+        """检测当前网络是否为国内网络环境
+
+        Returns:
+            tuple: (is_china: bool, ip: str, country: str, message: str)
+        """
+        import requests
+
+        self.logger.info("=" * 60)
+        self.logger.info("🌐 检测网络环境（国内/海外）")
+        self.logger.info("=" * 60)
+
+        # 方法1: 使用 ip-api.com 查询IP归属地
+        ip_api_services = [
+            'http://ip-api.com/json/?lang=zh-CN',
+            'https://ipwho.is/?lang=zh-CN',
+        ]
+
+        for service in ip_api_services:
+            try:
+                self.logger.info(f"正在查询网络归属地: {service}")
+                response = requests.get(service, timeout=15)
+
+                if response.status_code == 200:
+                    data = response.json()
+
+                    # ip-api.com 格式
+                    if 'countryCode' in data:
+                        country_code = data.get('countryCode', '')
+                        country = data.get('country', '')
+                        ip = data.get('query', '')
+
+                        is_china = country_code == 'CN'
+
+                        if is_china:
+                            msg = f"✓ 检测到国内网络环境 (IP: {ip}, 地区: {country})"
+                            self.logger.info(msg)
+                        else:
+                            msg = f"✗ 检测到海外网络环境 (IP: {ip}, 地区: {country} [{country_code}])"
+                            self.logger.warning(msg)
+
+                        self.logger.info("=" * 60)
+                        return is_china, ip, country, msg
+
+                    # ipwho.is 格式
+                    elif 'country_code' in data:
+                        country_code = data.get('country_code', '')
+                        country = data.get('country', '')
+                        ip = data.get('ip', '')
+
+                        is_china = country_code == 'CN'
+
+                        if is_china:
+                            msg = f"✓ 检测到国内网络环境 (IP: {ip}, 地区: {country})"
+                            self.logger.info(msg)
+                        else:
+                            msg = f"✗ 检测到海外网络环境 (IP: {ip}, 地区: {country} [{country_code}])"
+                            self.logger.warning(msg)
+
+                        self.logger.info("=" * 60)
+                        return is_china, ip, country, msg
+
+            except Exception as e:
+                self.logger.warning(f"查询服务 {service} 失败: {str(e)}")
+                continue
+
+        # 如果所有服务都失败，尝试通过连接国内网站判断
+        self.logger.info("IP归属地查询失败，尝试通过连接国内服务判断...")
+        try:
+            # 尝试连接微信公众号API（国内网络才能正常访问）
+            test_url = "https://api.weixin.qq.com/cgi-bin/get_api_domain_ip"
+            response = requests.get(test_url, timeout=10)
+
+            # 如果能连接，大概率是国内网络
+            if response.status_code == 200:
+                self.logger.info("✓ 能正常连接微信API，推测为国内网络")
+                return True, '', '未知', "推测为国内网络（基于微信API连接）"
+            else:
+                self.logger.warning("✗ 无法正常连接微信API，可能为海外网络")
+                return False, '', '未知', "可能为海外网络（微信API连接异常）"
+
+        except Exception as e:
+            self.logger.error(f"网络环境检测失败: {str(e)}")
+            return False, '', '未知', f"网络检测失败: {str(e)}"
 
     def _check_wechat_ip_whitelist(self) -> bool:
         """检查当前外网IP是否在微信公众号IP白名单中
@@ -9100,6 +9220,7 @@ def run_scheduler(config: Config, logger: Logger, keyword: str, max_pages: int,
 
     first_run = True  # 标记是否是第一次运行
     ip_check_failed = False  # IP白名单检查失败标志
+    network_not_china = False  # 非国内网络标志（v3.5.0 新增）
 
     while stop_flag['running']:
         try:
@@ -9114,11 +9235,9 @@ def run_scheduler(config: Config, logger: Logger, keyword: str, max_pages: int,
                     logger.info(f"📅 当前北京时间: {now_beijing.strftime('%Y-%m-%d %H:%M:%S')}")
 
                     # ========================================
-                    # IP白名单预检查（v3.4.0 新增）
+                    # 国内网络环境检测（v3.5.0 新增）
+                    # 推送文章到公众号需要国内网络环境
                     # ========================================
-                    if ip_check_failed:
-                        logger.info("🔍 重新检查IP白名单状态...")
-
                     logger.info("🚀 开始执行任务...")
 
                     # 每次运行都重新创建task，以触发主题轮换
@@ -9126,6 +9245,81 @@ def run_scheduler(config: Config, logger: Logger, keyword: str, max_pages: int,
                     if fresh_config.enable_theme_rotation:
                         logger.info(f"🎨 本次主题: {fresh_config.article_theme} (md2wechat: {fresh_config.md2wechat_theme})")
                     task = ZBBrainArticleTask(config.config_file)
+
+                    # 先检测网络环境（v3.5.0 新增）
+                    is_china, ip, country, network_msg = task._check_china_network()
+
+                    # 发送网络状态通知
+                    network_status_icon = "🇨🇳" if is_china else "🌍"
+                    network_status = "国内网络" if is_china else "海外网络"
+                    notifier = NotificationManager(fresh_config, logger)
+
+                    if not is_china:
+                        # 非国内网络，暂停运行并等待30分钟重试
+                        network_not_china = True
+                        logger.warning("=" * 60)
+                        logger.warning("❌ 检测到海外网络环境，暂停本次运行")
+                        logger.warning("📢 推送文章到微信公众号需要国内网络环境")
+                        logger.warning("⏭️ 将在 30 分钟后重新检查网络环境")
+                        logger.warning("=" * 60)
+
+                        stats_tracker.record_run(False, f"海外网络环境-{country}")
+
+                        # 发送网络状态通知给用户
+                        network_notify_msg = f"""🌐 **网络环境检测报告**
+
+{network_status_icon} **当前网络**: {network_status}
+📍 **IP地址**: {ip if ip else '未知'}
+🗺️ **地区**: {country if country else '未知'}
+
+---
+⚠️ **检测结果**: 非国内网络环境
+
+推送文章到微信公众号需要国内网络，本次运行已暂停。
+
+⏰ **下次检测**: 30分钟后自动重试
+
+---
+_总包大脑自动写作系统 v3.5.0_"""
+                        notifier.send_custom_message(network_notify_msg)
+
+                        # 等待30分钟后重试
+                        wait_seconds = 30 * 60  # 30分钟
+                        next_retry = now_beijing + timedelta(minutes=30)
+                        stats_tracker.set_next_run(next_retry)
+                        logger.info(f"⏭️ 下次网络检测时间: {next_retry.strftime('%Y-%m-%d %H:%M:%S')} (北京时间)")
+                        logger.info(f"😴 等待 30 分钟后重新检测网络环境...")
+
+                        # 分段等待，每5分钟检查一次
+                        waited = 0
+                        while waited < wait_seconds and stop_flag['running']:
+                            time.sleep(60)
+                            waited += 60
+
+                            # 检查是否超过停止时间
+                            current_check_hour = datetime.now(beijing_tz).hour
+                            if current_check_hour >= config.stop_run_hour:
+                                logger.info(f"🕛 当前时间 {current_check_hour}:00 已超过停止时间")
+                                break
+
+                            # 每5分钟发送一次网络等待通知
+                            if waited % 300 == 0 and waited > 0:
+                                minutes_waited = waited // 60
+                                logger.info(f"⏳ 等待网络环境... 已等待 {minutes_waited} 分钟")
+
+                        continue  # 跳过后续任务执行，重新循环检测网络
+
+                    else:
+                        # 国内网络，正常继续
+                        network_not_china = False
+                        logger.info(f"✓ {network_msg}")
+                        logger.info("✓ 网络环境正常，继续执行任务...")
+
+                    # ========================================
+                    # IP白名单预检查（v3.4.0）
+                    # ========================================
+                    if ip_check_failed:
+                        logger.info("🔍 重新检查IP白名单状态...")
 
                     # 先检查IP白名单
                     ip_ok = task._check_wechat_ip_whitelist()

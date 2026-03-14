@@ -1,6 +1,11 @@
+# ============================================================
+# ZBBrain-Write .gitignore
+# ============================================================
+
 # 敏感配置文件 - 包含API密钥和凭证
-ZBBrain-Write/config.ini
 **/config.ini
+config.ini
+ZBBrain-Write/config.ini
 
 # 日志文件
 *.log
@@ -9,35 +14,26 @@ ZBBrain-Write/zbbrain_article.log
 # 临时文件
 ZBBrain-Write/temp/
 *.tmp
-
-# 浏览器数据
-ZBBrain-Write/browser_data/
+temp/
 
 # 状态文件
 ZBBrain-Write/keyword_rotation.json
 ZBBrain-Write/theme_rotation.json
+ZBBrain-Write/cover_rotation.json
+ZBBrain-Write/service_registry.json
 
-# Python
+# 浏览器数据
+ZBBrain-Write/browser_data/
+browser_data/
+
+# 缓存
+ZBBrain-Write/.cache/
+.cache/
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
 
 # 虚拟环境
 venv/
@@ -48,6 +44,7 @@ env/
 # IDE
 .idea/
 .vscode/
+.cursor/
 *.swp
 *.swo
 *~
@@ -56,6 +53,13 @@ env/
 .DS_Store
 Thumbs.db
 
-# 临时测试文件
+# 可执行文件
+*.exe
+ZBBrain-Write/md2wechat.exe
+
+# 便携版目录
+ZBBrain-Write/portable/
+
+# 其他
 nul
 *.pdf
