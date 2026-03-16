@@ -2472,12 +2472,15 @@ class Config:
         # 智谱AI配置（敏感信息）
         self.zhipu_api_key = self.config.get('智谱AI', 'API Key')
         self.zhipu_api_url = sanitize_url(self.config.get('智谱AI', 'API 地址'))
+        # 【0成本优化 V2.0】使用 GLM-4.7-Flash 完全免费模型
+        # GLM-4.7-Flash: 200K上下文，同级别最强通用能力，完全免费
         # 低成本模型配置（用于简单任务，如生成问题、标题、图片提示词）- 免费
-        self.zhipu_model_fast = self.config.get('智谱AI', '低成本模型名称', fallback='glm-4-flash')
+        self.zhipu_model_fast = self.config.get('智谱AI', '低成本模型名称', fallback='glm-4.7-flash')
         # 标题生成也使用低成本模型，通过优化提示词提升质量
         self.zhipu_model_title = self.zhipu_model_fast
-        # 【0成本优化】高质量模型也使用免费模型，通过增强提示词保障质量
-        self.zhipu_model_pro = self.config.get('智谱AI', '高质量模型名称', fallback='glm-4-flash')
+        # 【0成本优化 V2.0】高质量模型也使用 GLM-4.7-Flash 免费，通过增强提示词保障质量
+        # GLM-4.7-Flash 能力足以胜任内容结构化和HTML排版任务
+        self.zhipu_model_pro = self.config.get('智谱AI', '高质量模型名称', fallback='glm-4.7-flash')
         # 图片生成模型配置（cogview-3-flash 免费，cogview-3 收费）
         self.image_model = self.config.get('智谱AI', '图片生成模型', fallback='cogview-3-flash')
         # 兼容旧配置（如果没有指定低/高质量模型，则使用统一的模型名称）
@@ -2505,6 +2508,10 @@ class Config:
         # 原创声明和评论配置
         self.declare_original = self.config.getboolean('微信公众号', '声明原创', fallback=True)
         self.enable_comment = self.config.getboolean('微信公众号', '开启评论', fallback=True)
+
+        # 定时发布配置
+        self.enable_schedule_publish = self.config.getboolean('微信公众号', '启用定时发布', fallback=False)
+        self.schedule_publish_delay = self.config.getint('微信公众号', '定时发布延迟分钟', fallback=15)
 
         # 企业微信配置
         self.wechat_webhook = sanitize_url(self.config.get('企业微信通知', 'Webhook地址'))
@@ -2588,6 +2595,12 @@ class Config:
 
         # 加载AI提示词配置
         self._load_prompts()
+
+        # 初始化多微信公众号配置
+        self._init_wechat_accounts()
+
+        # 初始化回复人设提示词轮换配置
+        self._init_prompts_rotation()
 
     def _load_prompts(self) -> None:
         """从配置文件加载AI提示词
@@ -2980,6 +2993,414 @@ class Config:
                 json.dump(state, f, ensure_ascii=False, indent=2)
         except Exception:
             pass
+
+    # =========================================================================
+    # 多微信公众号轮换功能
+    # =========================================================================
+
+    def _init_wechat_accounts(self) -> None:
+        """初始化多微信公众号配置"""
+        # 微信公众号配置文件路径
+        self.wechat_accounts_file = self.config.get('微信公众号', '公众号配置文件',
+                                                      fallback='./wechat_accounts.json')
+
+        # 加载公众号列表
+        self.wechat_accounts = []
+        self.current_account_index = 0
+
+        try:
+            # 尝试从配置文件加载
+            accounts_data = self._load_wechat_accounts_config()
+
+            if accounts_data and 'accounts' in accounts_data:
+                # 只加载启用状态的公众号
+                self.wechat_accounts = [
+                    acc for acc in accounts_data['accounts']
+                    if acc.get('enabled', True)
+                ]
+
+                if self.wechat_accounts:
+                    # 加载轮换状态
+                    rotation_state = accounts_data.get('rotation', {})
+                    self.current_account_index = rotation_state.get('current_index', 0)
+
+                    # 确保索引在有效范围内
+                    if self.current_account_index >= len(self.wechat_accounts):
+                        self.current_account_index = 0
+
+                    if hasattr(self, 'logger') and self.logger:
+                        self.logger.info(f"✓ 加载了 {len(self.wechat_accounts)} 个微信公众号配置")
+                        for i, acc in enumerate(self.wechat_accounts):
+                            self.logger.info(f"  [{i+1}] {acc.get('name', '未命名')}")
+                else:
+                    if hasattr(self, 'logger') and self.logger:
+                        self.logger.warning("没有启用状态的微信公众号，使用默认配置")
+                    self._use_default_wechat_config()
+            else:
+                if hasattr(self, 'logger') and self.logger:
+                    self.logger.warning("微信公众号配置文件格式不正确或为空，使用默认配置")
+                self._use_default_wechat_config()
+
+        except Exception as e:
+            if hasattr(self, 'logger') and self.logger:
+                self.logger.warning(f"加载微信公众号配置失败: {str(e)}，使用默认配置")
+            self._use_default_wechat_config()
+
+    def _use_default_wechat_config(self) -> None:
+        """使用默认的微信公众号配置（兼容旧版）"""
+        self.wechat_accounts = [{
+            'name': '默认公众号',
+            'appid': self.wechat_appid,
+            'appsecret': self.wechat_secret,
+            'default_author': self.default_author,
+            'enabled': True
+        }]
+        self.current_account_index = 0
+
+    def _load_wechat_accounts_config(self) -> Dict[str, Any]:
+        """加载微信公众号配置文件
+
+        Returns:
+            Dict: 包含公众号列表和轮换状态的字典
+        """
+        try:
+            # 处理相对路径
+            config_path = self.wechat_accounts_file
+            if not os.path.isabs(config_path):
+                script_dir = Path(__file__).parent.resolve()
+                config_path = script_dir / config_path
+
+            if os.path.exists(config_path):
+                with open(config_path, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+        except Exception as e:
+            if hasattr(self, 'logger') and self.logger:
+                self.logger.error(f"读取微信公众号配置文件失败: {str(e)}")
+        return {}
+
+    def _save_wechat_accounts_rotation(self) -> None:
+        """保存微信公众号轮换状态"""
+        try:
+            # 读取完整配置
+            accounts_data = self._load_wechat_accounts_config()
+
+            if not accounts_data:
+                accounts_data = {'accounts': self.wechat_accounts, 'rotation': {}}
+
+            # 更新轮换状态
+            accounts_data['rotation'] = {
+                'current_index': self.current_account_index,
+                'last_updated': datetime.now().isoformat()
+            }
+
+            # 处理相对路径
+            config_path = self.wechat_accounts_file
+            if not os.path.isabs(config_path):
+                script_dir = Path(__file__).parent.resolve()
+                config_path = script_dir / config_path
+
+            with open(config_path, 'w', encoding='utf-8') as f:
+                json.dump(accounts_data, f, ensure_ascii=False, indent=4)
+
+        except Exception as e:
+            if hasattr(self, 'logger') and self.logger:
+                self.logger.warning(f"保存微信公众号轮换状态失败: {str(e)}")
+
+    def get_current_wechat_account(self) -> Dict[str, str]:
+        """获取当前要使用的微信公众号配置
+
+        Returns:
+            Dict: 包含 name, appid, appsecret, default_author 的字典
+        """
+        if not self.wechat_accounts:
+            self._init_wechat_accounts()
+
+        if self.wechat_accounts:
+            account = self.wechat_accounts[self.current_account_index]
+            return {
+                'name': account.get('name', '未命名'),
+                'appid': account.get('appid', ''),
+                'appsecret': account.get('appsecret', ''),
+                'default_author': account.get('default_author', '总包大脑')
+            }
+
+        # 回退到默认配置
+        return {
+            'name': '默认公众号',
+            'appid': self.wechat_appid,
+            'appsecret': self.wechat_secret,
+            'default_author': self.default_author
+        }
+
+    def rotate_to_next_wechat_account(self) -> Dict[str, str]:
+        """轮换到下一个微信公众号并返回其配置
+
+        Returns:
+            Dict: 下一个公众号的配置
+        """
+        if not self.wechat_accounts:
+            self._init_wechat_accounts()
+
+        if len(self.wechat_accounts) <= 1:
+            # 只有一个公众号，无需轮换
+            return self.get_current_wechat_account()
+
+        # 获取当前公众号（用于日志）
+        current_account = self.get_current_wechat_account()
+
+        # 计算下一个索引（循环轮换）
+        self.current_account_index = (self.current_account_index + 1) % len(self.wechat_accounts)
+
+        # 保存轮换状态
+        self._save_wechat_accounts_rotation()
+
+        # 获取下一个公众号配置
+        next_account = self.get_current_wechat_account()
+
+        if hasattr(self, 'logger') and self.logger:
+            self.logger.info(f"🔄 公众号轮换: {current_account['name']} → {next_account['name']}")
+
+        return next_account
+
+    def set_wechat_account(self, account: Dict[str, str]) -> None:
+        """设置当前使用的微信公众号配置
+
+        Args:
+            account: 包含 appid, appsecret, default_author 的字典
+        """
+        self.wechat_appid = account.get('appid', '')
+        self.wechat_secret = account.get('appsecret', '')
+        self.default_author = account.get('default_author', '总包大脑')
+
+        if hasattr(self, 'logger') and self.logger:
+            self.logger.info(f"✓ 切换到公众号: {account.get('name', '未命名')}")
+            self.logger.info(f"  AppID: {self.wechat_appid[:8]}...")
+            self.logger.info(f"  默认作者: {self.default_author}")
+
+    def get_all_wechat_accounts(self) -> list:
+        """获取所有微信公众号配置列表
+
+        Returns:
+            List: 公众号配置列表
+        """
+        if not self.wechat_accounts:
+            self._init_wechat_accounts()
+        return self.wechat_accounts.copy()
+
+    # =========================================================================
+    # 回复人设提示词轮换功能
+    # =========================================================================
+
+    def _init_prompts_rotation(self) -> None:
+        """初始化回复人设提示词轮换功能"""
+        # 提示词轮换配置文件路径
+        self.prompts_rotation_file = self.config.get('总包大脑', '提示词轮换配置文件',
+                                                      fallback='./prompt_rotation.json')
+        # 提示词文件夹路径
+        self.prompts_folder = self.config.get('总包大脑', '提示词文件夹',
+                                               fallback='./Prompt')
+        # 【v3.6.2新增】长思考模式配置
+        self.enable_long_thinking = self.config.getboolean('总包大脑', '启用长思考模式',
+                                                            fallback=True)
+
+        # 加载提示词列表
+        self.prompts_list = []
+        self.current_prompt_index = 0
+
+        try:
+            # 尝试从配置文件加载
+            prompts_data = self._load_prompts_rotation_config()
+
+            if prompts_data and 'prompts' in prompts_data:
+                # 只加载启用状态的提示词
+                self.prompts_list = [
+                    prompt for prompt in prompts_data['prompts']
+                    if prompt.get('enabled', True)
+                ]
+
+                if self.prompts_list:
+                    # 加载轮换状态
+                    rotation_state = prompts_data.get('rotation', {})
+                    self.current_prompt_index = rotation_state.get('current_index', 0)
+
+                    # 确保索引在有效范围内
+                    if self.current_prompt_index >= len(self.prompts_list):
+                        self.current_prompt_index = 0
+
+                    if hasattr(self, 'logger') and self.logger:
+                        self.logger.info(f"✓ 加载了 {len(self.prompts_list)} 套回复人设提示词")
+                        for i, prompt in enumerate(self.prompts_list):
+                            self.logger.info(f"  [{i+1}] {prompt.get('name', '未命名')}")
+                else:
+                    if hasattr(self, 'logger') and self.logger:
+                        self.logger.warning("没有启用状态的提示词，将使用默认提示词")
+                    self._use_default_prompt()
+            else:
+                if hasattr(self, 'logger') and self.logger:
+                    self.logger.warning("提示词配置文件格式不正确或为空，将使用默认提示词")
+                self._use_default_prompt()
+
+        except Exception as e:
+            if hasattr(self, 'logger') and self.logger:
+                self.logger.warning(f"加载提示词配置失败: {str(e)}，将使用默认提示词")
+            self._use_default_prompt()
+
+    def _use_default_prompt(self) -> None:
+        """使用默认提示词（兼容旧版）"""
+        self.prompts_list = [{
+            'name': '默认版',
+            'file': '',
+            'enabled': True
+        }]
+        self.current_prompt_index = 0
+
+    def _load_prompts_rotation_config(self) -> Dict[str, Any]:
+        """加载提示词轮换配置文件
+
+        Returns:
+            Dict: 包含提示词列表和轮换状态的字典
+        """
+        try:
+            # 处理相对路径
+            config_path = self.prompts_rotation_file
+            if not os.path.isabs(config_path):
+                script_dir = Path(__file__).parent.resolve()
+                config_path = script_dir / config_path
+
+            if os.path.exists(config_path):
+                with open(config_path, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+        except Exception as e:
+            if hasattr(self, 'logger') and self.logger:
+                self.logger.error(f"读取提示词配置文件失败: {str(e)}")
+        return {}
+
+    def _save_prompts_rotation_state(self) -> None:
+        """保存提示词轮换状态"""
+        try:
+            # 读取完整配置
+            prompts_data = self._load_prompts_rotation_config()
+
+            if not prompts_data:
+                prompts_data = {'prompts': self.prompts_list, 'rotation': {}}
+
+            # 更新轮换状态
+            prompts_data['rotation'] = {
+                'current_index': self.current_prompt_index,
+                'last_updated': datetime.now().isoformat()
+            }
+
+            # 处理相对路径
+            config_path = self.prompts_rotation_file
+            if not os.path.isabs(config_path):
+                script_dir = Path(__file__).parent.resolve()
+                config_path = script_dir / config_path
+
+            with open(config_path, 'w', encoding='utf-8') as f:
+                json.dump(prompts_data, f, ensure_ascii=False, indent=4)
+
+        except Exception as e:
+            if hasattr(self, 'logger') and self.logger:
+                self.logger.warning(f"保存提示词轮换状态失败: {str(e)}")
+
+    def get_current_prompt(self) -> Dict[str, str]:
+        """获取当前要使用的回复人设提示词配置
+
+        Returns:
+            Dict: 包含 name, file, content 的字典
+        """
+        if not self.prompts_list:
+            self._init_prompts_rotation()
+
+        if self.prompts_list:
+            prompt = self.prompts_list[self.current_prompt_index]
+
+            # 读取提示词内容
+            content = self._load_prompt_content(prompt.get('file', ''))
+
+            return {
+                'name': prompt.get('name', '未命名'),
+                'file': prompt.get('file', ''),
+                'content': content
+            }
+
+        # 回退到默认提示词
+        return {
+            'name': '默认版',
+            'file': '',
+            'content': ''
+        }
+
+    def _load_prompt_content(self, prompt_file: str) -> str:
+        """加载提示词文件内容
+
+        Args:
+            prompt_file: 提示词文件名
+
+        Returns:
+            str: 提示词内容
+        """
+        if not prompt_file:
+            return ''
+
+        try:
+            # 处理路径
+            prompt_path = prompt_file
+            if not os.path.isabs(prompt_path):
+                script_dir = Path(__file__).parent.resolve()
+                prompt_path = script_dir / self.prompts_folder / prompt_file
+
+            if os.path.exists(prompt_path):
+                with open(prompt_path, 'r', encoding='utf-8') as f:
+                    return f.read()
+            else:
+                if hasattr(self, 'logger') and self.logger:
+                    self.logger.warning(f"提示词文件不存在: {prompt_path}")
+                return ''
+        except Exception as e:
+            if hasattr(self, 'logger') and self.logger:
+                self.logger.error(f"读取提示词文件失败: {str(e)}")
+            return ''
+
+    def rotate_to_next_prompt(self) -> Dict[str, str]:
+        """轮换到下一个回复人设提示词并返回其配置
+
+        Returns:
+            Dict: 下一个提示词的配置
+        """
+        if not self.prompts_list:
+            self._init_prompts_rotation()
+
+        if len(self.prompts_list) <= 1:
+            # 只有一个提示词，无需轮换
+            return self.get_current_prompt()
+
+        # 获取当前提示词（用于日志）
+        current_prompt = self.get_current_prompt()
+
+        # 计算下一个索引（循环轮换）
+        self.current_prompt_index = (self.current_prompt_index + 1) % len(self.prompts_list)
+
+        # 保存轮换状态
+        self._save_prompts_rotation_state()
+
+        # 获取下一个提示词配置
+        next_prompt = self.get_current_prompt()
+
+        if hasattr(self, 'logger') and self.logger:
+            self.logger.info(f"🔄 提示词轮换: {current_prompt['name']} → {next_prompt['name']}")
+
+        return next_prompt
+
+    def get_all_prompts(self) -> list:
+        """获取所有回复人设提示词配置列表
+
+        Returns:
+            List: 提示词配置列表
+        """
+        if not self.prompts_list:
+            self._init_prompts_rotation()
+        return self.prompts_list.copy()
 
     def _validate_config(self) -> None:
         """
@@ -4170,17 +4591,29 @@ class ZhipuAIAnalyzer:
         context = self._build_context(articles)
         prompt = self._build_prompt(context)
 
+        # 0成本优化：GLM-4.7-Flash 对空输入更敏感，需要确保内容非空
+        if not prompt or not prompt.strip():
+            self.logger.warning("文章上下文为空，使用默认提示")
+            prompt = "暂无具体文章内容，请基于EPC总承包行业常识生成一个热点问题。"
+
+        # 确保提示词非空
+        system_prompt = self.config.prompt_hot_question_system or "你是EPC总承包行业专家，请生成一个热点问题。"
+        user_prompt_template = self.config.prompt_hot_question_user or "基于以下内容生成热点问题：{articles_context}"
+        user_prompt = user_prompt_template.format(articles_context=prompt)
+
+        self.logger.debug(f"热点问题生成 - 系统提示词长度: {len(system_prompt)}, 用户提示词长度: {len(user_prompt)}")
+
         try:
             response = self.client.chat.completions.create(
-                model=self.config.zhipu_model_fast,  # 使用低成本模型（glm-4-flash）生成问题
+                model=self.config.zhipu_model_fast,  # 使用0成本模型（glm-4.7-flash）生成问题
                 messages=[
                     {
                         "role": "system",
-                        "content": self.config.prompt_hot_question_system  # 从配置文件读取
+                        "content": system_prompt
                     },
                     {
                         "role": "user",
-                        "content": self.config.prompt_hot_question_user.format(articles_context=prompt)
+                        "content": user_prompt
                     }
                 ],
                 temperature=0.8,
@@ -4188,14 +4621,41 @@ class ZhipuAIAnalyzer:
             )
 
             question = response.choices[0].message.content.strip()
-            question = self._validate_question(question)
+
+            # 【0成本优化V2.1】GLM-4.7-Flash 偶尔返回空响应，需要处理
+            if not question or not question.strip():
+                self.logger.warning("AI返回空响应，使用备用热点问题")
+                # 使用备用问题列表
+                backup_questions = [
+                    "在EPC总承包项目实施阶段，面对材料价格波动和工期压力的双重挑战，如何通过精细化管理实现成本控制和进度优化的平衡？",
+                    "EPC总承包项目在结算阶段常遇到哪些争议问题？如何通过合同管理和证据保全来有效维护自身权益？",
+                    "在当前市场环境下，EPC总承包企业如何通过数字化转型提升项目管理效率和风险防控能力？",
+                    "EPC项目联合体合作中，如何合理分配利润和风险，确保各方利益均衡且项目顺利推进？",
+                    "面对日益严格的环保要求，EPC总承包项目如何实现绿色施工与成本效益的双赢？"
+                ]
+                import random
+                question = random.choice(backup_questions)
+                self.logger.info(f"使用备用热点问题: {question}")
+            else:
+                question = self._validate_question(question)
 
             self.logger.info(f"生成热点问题: {question}")
             return question
 
         except Exception as e:
             self.logger.error(f"智谱AI调用失败: {str(e)}")
-            raise
+            # 【0成本优化V2.1】失败时使用备用问题而不是抛出异常
+            backup_questions = [
+                "在EPC总承包项目实施阶段，面对材料价格波动和工期压力的双重挑战，如何通过精细化管理实现成本控制和进度优化的平衡？",
+                "EPC总承包项目在结算阶段常遇到哪些争议问题？如何通过合同管理和证据保全来有效维护自身权益？",
+                "在当前市场环境下，EPC总承包企业如何通过数字化转型提升项目管理效率和风险防控能力？",
+                "EPC项目联合体合作中，如何合理分配利润和风险，确保各方利益均衡且项目顺利推进？",
+                "面对日益严格的环保要求，EPC总承包项目如何实现绿色施工与成本效益的双赢？"
+            ]
+            import random
+            question = random.choice(backup_questions)
+            self.logger.info(f"AI调用失败，使用备用热点问题: {question}")
+            return question
 
     def _build_context(self, articles: List[Dict]) -> str:
         """构建分析上下文（包含标题、优化摘要、关键词、分类、情感）"""
@@ -4853,8 +5313,14 @@ class MetasoAutomation:
             return False
 
     @profile
-    async def send_question_and_get_answer(self, question: str, max_retry: int = None) -> Optional[str]:
-        """发送问题到总包大脑并获取回答"""
+    async def send_question_and_get_answer(self, question: str, max_retry: int = None, prompt_content: str = None) -> Optional[str]:
+        """发送问题到总包大脑并获取回答
+
+        Args:
+            question: 要发送的问题
+            max_retry: 最大重试次数
+            prompt_content: 回复人设提示词内容（可选，用于轮换）
+        """
         max_retry = max_retry or self.config.max_retry_times
         self.last_question = question
         self._browser_restart_count = 0  # 重置重启计数器
@@ -4893,6 +5359,15 @@ class MetasoAutomation:
                         await self.browser.close()
                         continue
 
+                # 如果提供了回复人设提示词，先设置回复人设
+                if prompt_content:
+                    self.logger.info("步骤3.1: 设置回复人设提示词")
+                    if await self._set_reply_persona(prompt_content):
+                        self.logger.info("✓ 回复人设设置成功，等待10秒后发送问题...")
+                        await asyncio.sleep(10)  # 等待10秒
+                    else:
+                        self.logger.warning("回复人设设置失败，继续使用默认设置")
+
                 # 发送问题
                 await self._send_question(question)
 
@@ -4917,6 +5392,783 @@ class MetasoAutomation:
 
         self.logger.info(f"成功获取回答，长度: {len(answer)} 字符")
         return answer
+
+    async def _set_reply_persona(self, prompt_content: str) -> bool:
+        """设置总包大脑的回复人设
+
+        实现完整的人设轮换功能：
+        1. 精确定位并点击设置齿轮按钮
+        2. 等待浮动弹窗出现
+        3. 点击"回复人设"标签
+        4. 输入提示词
+        5. 保存设置
+
+        Args:
+            prompt_content: 回复人设提示词内容
+
+        Returns:
+            bool: 设置是否成功
+        """
+        self.logger.info("=" * 50)
+        self.logger.info("开始设置回复人设...")
+        self.logger.info("=" * 50)
+
+        try:
+            # 等待页面稳定并验证页面已正确加载
+            max_page_wait = 3
+            for page_wait in range(max_page_wait):
+                await asyncio.sleep(3)
+
+                # 验证页面是否正确加载
+                page_loaded = await self.browser.page.evaluate('''() => {
+                    let found = false;
+                    document.querySelectorAll('*').forEach((el) => {
+                        const text = (el.innerText || '').trim();
+                        if ((text.includes('总包行业大脑') || text.includes('总包大脑')) && text.length < 20) {
+                            const rect = el.getBoundingClientRect();
+                            if (rect.width > 0 && rect.height > 0 && rect.top < 60) {
+                                found = true;
+                            }
+                        }
+                    });
+                    return found;
+                }''')
+
+                if page_loaded:
+                    self.logger.info("  页面已正确加载（检测到总包大脑标题）")
+                    break
+                else:
+                    self.logger.warning(f"  页面未正确加载，等待重试... ({page_wait + 1}/{max_page_wait})")
+                    if page_wait < max_page_wait - 1:
+                        # 尝试刷新页面
+                        try:
+                            await self.browser.page.reload(wait_until='domcontentloaded', timeout=30000)
+                        except:
+                            pass
+
+            # ===== Step 1: 查找并点击设置按钮（带重试） =====
+            max_retry = 3
+            settings_clicked = False
+
+            for retry in range(max_retry):
+                self.logger.info(f"[Step 1] 查找并点击设置按钮... (尝试 {retry + 1}/{max_retry})")
+
+                settings_clicked = await self._click_settings_gear_button()
+
+                if settings_clicked:
+                    break
+
+                if retry < max_retry - 1:
+                    self.logger.warning(f"  设置按钮点击失败，等待后重试...")
+                    await asyncio.sleep(2)
+                    # 尝试刷新页面
+                    try:
+                        await self.browser.page.reload(wait_until='domcontentloaded', timeout=30000)
+                        await asyncio.sleep(3)
+                    except:
+                        pass
+
+            if not settings_clicked:
+                self.logger.error("未能点击设置按钮")
+                return False
+
+            self.logger.info("[OK] 设置按钮点击成功")
+
+            # 等待浮动弹窗出现
+            await asyncio.sleep(2)
+
+            # ===== Step 2: 点击"回复人设"标签 =====
+            self.logger.info("[Step 2] 点击'回复人设'标签...")
+
+            persona_tab_clicked = await self._click_persona_tab_in_panel()
+
+            if not persona_tab_clicked:
+                self.logger.warning("未能点击'回复人设'标签，尝试继续...")
+
+            # 等待标签切换
+            await asyncio.sleep(1)
+
+            # ===== Step 3: 输入提示词 =====
+            self.logger.info("[Step 3] 输入提示词...")
+
+            input_success = await self._input_persona_prompt(prompt_content)
+
+            if not input_success:
+                self.logger.warning("输入提示词可能未成功")
+
+            # 等待输入完成
+            await asyncio.sleep(1)
+
+            # ===== Step 4: 保存设置 =====
+            self.logger.info("[Step 4] 保存设置...")
+
+            save_success = await self._click_save_button()
+
+            if not save_success:
+                self.logger.warning("保存设置可能未成功")
+
+            # 等待保存完成
+            await asyncio.sleep(2)
+
+            # ===== Step 5: 关闭设置面板 =====
+            self.logger.info("[Step 5] 关闭设置面板...")
+            await self._close_settings_panel()
+
+            # 等待面板关闭动画完成
+            await asyncio.sleep(1)
+
+            # 重新导航到总包大脑页面
+            self.logger.info("  重新导航到总包大脑页面...")
+            try:
+                await self.browser.page.goto(self.config.metaso_url, wait_until='domcontentloaded', timeout=30000)
+                await asyncio.sleep(3)
+                self.logger.info("  [OK] 已重新打开总包大脑页面")
+            except Exception as e:
+                self.logger.warning(f"  导航失败: {str(e)}")
+
+            self.logger.info("=" * 50)
+            self.logger.info("回复人设设置流程完成")
+            self.logger.info("=" * 50)
+
+            return True
+
+        except Exception as e:
+            self.logger.error(f"设置回复人设时出错: {str(e)}")
+            return False
+
+    async def _click_settings_gear_button(self) -> bool:
+        """点击设置齿轮按钮 - 位于"总包行业大脑"文字右侧"""
+        self.logger.info("  查找设置齿轮按钮（总包行业大脑右侧）...")
+
+        try:
+            # 首先找到"总包行业大脑"或"总包大脑"文字的位置
+            settings_info = await self.browser.page.evaluate('''() => {
+                const buttons = document.querySelectorAll('button');
+                let zongbaoBtn = null;
+                let bestMatch = null;
+                let candidates = [];
+
+                // 步骤1: 找到包含"总包"文字的元素
+                let zongbaoLeft = 0;
+                let zongbaoRight = 0;
+                let zongbaoTop = 0;
+
+                document.querySelectorAll('*').forEach((el) => {
+                    const text = (el.innerText || '').trim();
+                    if ((text.includes('总包行业大脑') || text.includes('总包大脑')) && text.length < 20) {
+                        const rect = el.getBoundingClientRect();
+                        if (rect.width > 0 && rect.height > 0 && rect.top < 60) {
+                            zongbaoLeft = Math.round(rect.left);
+                            zongbaoRight = Math.round(rect.right);
+                            zongbaoTop = Math.round(rect.top);
+                        }
+                    }
+                });
+
+                // 步骤2: 在"总包大脑"右侧查找齿轮按钮
+                for (const btn of buttons) {
+                    const rect = btn.getBoundingClientRect();
+                    if (rect.top > 80 || rect.width === 0 || rect.height === 0) continue;
+
+                    const svg = btn.querySelector('svg');
+                    if (!svg) continue;
+
+                    const viewBox = svg.getAttribute('viewBox') || '';
+                    const paths = svg.querySelectorAll('path');
+                    const pathCount = paths.length;
+                    const btnText = (btn.innerText || '').trim();
+
+                    const candidate = {
+                        left: Math.round(rect.left),
+                        top: Math.round(rect.top),
+                        width: Math.round(rect.width),
+                        height: Math.round(rect.height),
+                        viewBox: viewBox,
+                        pathCount: pathCount,
+                        text: btnText.substring(0, 20),
+                        isRightOfZongbao: zongbaoRight > 0 && rect.left > zongbaoRight && rect.left < zongbaoRight + 100
+                    };
+                    candidates.push(candidate);
+
+                    // 检查是否是齿轮图标: viewBox="0 0 20 20", 2个path, 无文字
+                    if (viewBox === '0 0 20 20' && pathCount === 2 && !btnText) {
+                        const path0 = paths[0] ? (paths[0].getAttribute('d') || '').length : 0;
+                        const path1 = paths[1] ? (paths[1].getAttribute('d') || '').length : 0;
+
+                        candidate.path0Len = path0;
+                        candidate.path1Len = path1;
+
+                        // 优先选择在"总包大脑"右侧的齿轮按钮
+                        if (candidate.isRightOfZongbao && path0 > 100 && path1 > 20) {
+                            bestMatch = candidate;
+                        }
+                    }
+                }
+
+                return {
+                    bestMatch: bestMatch,
+                    candidates: candidates.sort((a, b) => a.left - b.left),
+                    zongbaoRight: zongbaoRight,
+                    zongbaoTop: zongbaoTop
+                };
+            }''')
+
+            self.logger.info(f"  总包大脑 right={settings_info.get('zongbaoRight', 0)}, top={settings_info.get('zongbaoTop', 0)}")
+
+            if settings_info.get('bestMatch'):
+                btn = settings_info['bestMatch']
+                self.logger.info(f"  找到齿轮按钮 at left={btn['left']}")
+
+                # 使用JavaScript直接点击按钮（更可靠）
+                clicked = await self.browser.page.evaluate(f'''() => {{
+                    const buttons = document.querySelectorAll('button');
+                    for (const btn of buttons) {{
+                        const rect = btn.getBoundingClientRect();
+                        if (rect.left >= {btn['left'] - 5} && rect.left <= {btn['left'] + 5} &&
+                            rect.top >= {btn['top'] - 5} && rect.top <= {btn['top'] + 5}) {{
+                            btn.click();
+                            return true;
+                        }}
+                    }}
+                    return false;
+                }}''')
+
+                await asyncio.sleep(3)  # 增加等待时间
+
+                if await self._verify_settings_panel_open():
+                    self.logger.info("  [OK] 齿轮按钮点击成功，设置弹窗已打开")
+                    return True
+                else:
+                    # 如果JavaScript点击失败，尝试鼠标点击
+                    self.logger.info("  JS点击失败，尝试鼠标点击...")
+                    x = btn['left'] + btn['width'] // 2
+                    y = btn['top'] + btn['height'] // 2
+                    await self.browser.page.mouse.click(x, y)
+                    await asyncio.sleep(3)
+                    if await self._verify_settings_panel_open():
+                        self.logger.info("  [OK] 鼠标点击成功，设置弹窗已打开")
+                        return True
+
+            # 方法2: 尝试所有候选按钮
+            for c in settings_info.get('candidates', []):
+                if c['viewBox'] == '0 0 20 20' and c['pathCount'] == 2 and not c['text'] and c['left'] > 200:
+                    self.logger.info(f"  尝试候选按钮 at left={c['left']}...")
+
+                    await self.browser.page.keyboard.press('Escape')
+                    await asyncio.sleep(0.5)
+
+                    # 使用JavaScript点击
+                    clicked = await self.browser.page.evaluate(f'''() => {{
+                        const buttons = document.querySelectorAll('button');
+                        for (const btn of buttons) {{
+                            const rect = btn.getBoundingClientRect();
+                            if (rect.left >= {c['left'] - 5} && rect.left <= {c['left'] + 5}) {{
+                                btn.click();
+                                return true;
+                            }}
+                        }}
+                        return false;
+                    }}''')
+
+                    await asyncio.sleep(3)
+
+                    if await self._verify_settings_panel_open():
+                        self.logger.info("  [OK] 通过候选按钮打开设置弹窗")
+                        return True
+
+            # 方法3: 尝试特定坐标（总包行业大脑右侧区域）
+            # 根据用户截图，设置按钮在"总包行业大脑"文字右侧
+            self.logger.info("  尝试坐标点击（总包行业大脑右侧）...")
+            zongbao_right = settings_info.get('zongbaoRight', 200)
+            coords_to_try = [
+                (zongbao_right + 12, 27),   # 总包大脑右侧12px (精确位置)
+                (zongbao_right + 20, 27),   # 总包大脑右侧20px
+                (281, 27),   # 备用位置
+            ]
+
+            for x, y in coords_to_try:
+                self.logger.info(f"  尝试坐标 ({x}, {y})...")
+
+                await self.browser.page.keyboard.press('Escape')
+                await asyncio.sleep(0.5)
+                await self.browser.page.mouse.click(x, y)
+                await asyncio.sleep(3)
+
+                if await self._verify_settings_panel_open():
+                    self.logger.info(f"  [OK] 通过坐标 ({x}, {y}) 打开设置弹窗")
+                    return True
+
+            # 方法4: 使用AI辅助
+            try:
+                instruction = """Click on the settings button (gear/cog icon) in the top right area of the page header. This should open a floating settings panel."""
+                success = await self.browser.act(instruction, timeout=15000)
+                if success:
+                    await asyncio.sleep(2)
+                    if await self._verify_settings_panel_open():
+                        self.logger.info("  [OK] 通过AI识别点击设置按钮")
+                        return True
+            except Exception as e:
+                self.logger.debug(f"  AI识别失败: {str(e)}")
+
+            return False
+
+        except Exception as e:
+            self.logger.error(f"  点击设置按钮失败: {str(e)}")
+            return False
+
+    async def _verify_settings_panel_open(self) -> bool:
+        """验证设置弹窗是否已打开"""
+        try:
+            panel_check = await self.browser.page.evaluate('''() => {
+                // 方法1: 检查常见弹窗选择器
+                const selectors = [
+                    '[role="dialog"]',
+                    '[class*="Popover"]',
+                    '[class*="popover"]',
+                    '[class*="Modal"]',
+                    '[class*="modal"]',
+                    '[class*="Drawer"]',
+                    '[class*="drawer"]',
+                    '[class*="Panel"]',
+                    '[class*="panel"]',
+                    '[class*="Popup"]',
+                    '[class*="popup"]',
+                    '[class*="Dropdown"]',
+                    '[class*="dropdown"]'
+                ];
+
+                for (const sel of selectors) {
+                    const panels = document.querySelectorAll(sel);
+                    for (const panel of panels) {
+                        const rect = panel.getBoundingClientRect();
+                        if (rect.width > 200 && rect.height > 200) {
+                            const text = panel.innerText || '';
+                            if (text.includes('专题设置') || text.includes('设置') ||
+                                text.includes('回复人设') || text.includes('人设')) {
+                                return { found: true, method: 'selector', selector: sel };
+                            }
+                        }
+                    }
+                }
+
+                // 方法2: 检查fixed/absolute定位的大面板
+                const allDivs = document.querySelectorAll('div');
+                for (const div of allDivs) {
+                    const rect = div.getBoundingClientRect();
+                    const style = window.getComputedStyle(div);
+                    const position = style.position;
+                    const zIndex = parseInt(style.zIndex) || 0;
+
+                    if ((position === 'fixed' || position === 'absolute') &&
+                        rect.width > 200 && rect.height > 200 && zIndex >= 0) {
+                        const text = div.innerText || '';
+                        if (text.includes('专题设置') || text.includes('回复人设')) {
+                            return { found: true, method: 'position_check' };
+                        }
+                    }
+                }
+
+                // 方法3: 检查页面是否出现了设置相关文本（简化版）
+                const bodyText = document.body.innerText;
+                if (bodyText.includes('专题设置') || bodyText.includes('回复人设')) {
+                    // 查找任何可见的大面板
+                    const allElements = document.querySelectorAll('*');
+                    for (const el of allElements) {
+                        const rect = el.getBoundingClientRect();
+                        const style = window.getComputedStyle(el);
+                        if (rect.width > 200 && rect.height > 200 &&
+                            (style.position === 'fixed' || style.position === 'absolute') &&
+                            style.display !== 'none' && style.visibility !== 'hidden') {
+                            return { found: true, method: 'text_found' };
+                        }
+                    }
+                }
+
+                return { found: false };
+            }''')
+
+            if panel_check.get('found'):
+                self.logger.info(f"    检测到设置面板 (method={panel_check.get('method', 'unknown')})")
+                return True
+
+            return False
+
+        except Exception as e:
+            self.logger.debug(f"  面板验证失败: {str(e)}")
+            return False
+
+    async def _click_persona_tab_in_panel(self) -> bool:
+        """在设置弹窗中点击'回复人设'标签"""
+        try:
+            # 使用JavaScript直接查找并点击标签
+            clicked = await self.browser.page.evaluate('''() => {
+                // 搜索所有可能包含标签的元素
+                const allElements = document.querySelectorAll('button, div[role="tab"], span, a, [class*="tab"], [class*="Tab"]');
+                for (const el of allElements) {
+                    const text = (el.innerText || '').trim();
+                    if (text === '回复人设' || text === '人设') {
+                        el.click();
+                        return { found: true, text: text, tagName: el.tagName };
+                    }
+                }
+                return { found: false };
+            }''')
+
+            if clicked.get('found'):
+                self.logger.info(f"  [OK] 已点击'{clicked['text']}'标签 ({clicked['tagName']})")
+                await asyncio.sleep(1)
+                return True
+
+            # 备用方法: 鼠标点击
+            tab_info = await self.browser.page.evaluate('''() => {
+                const allElements = document.querySelectorAll('*');
+                for (const el of allElements) {
+                    const rect = el.getBoundingClientRect();
+                    const text = (el.innerText || '').trim();
+                    if (rect.width > 0 && rect.height > 0 && rect.width < 200 &&
+                        (text === '回复人设' || text === '人设')) {
+                        return {
+                            found: true,
+                            text: text,
+                            left: Math.round(rect.left),
+                            top: Math.round(rect.top),
+                            width: Math.round(rect.width),
+                            height: Math.round(rect.height)
+                        };
+                    }
+                }
+                return { found: false };
+            }''')
+
+            if tab_info.get('found'):
+                self.logger.info(f"  找到'{tab_info['text']}'标签，尝试鼠标点击")
+                x = tab_info['left'] + tab_info['width'] // 2
+                y = tab_info['top'] + tab_info['height'] // 2
+                await self.browser.page.mouse.click(x, y)
+                await asyncio.sleep(1)
+                return True
+
+            self.logger.warning("  未找到'回复人设'标签，尝试AI辅助...")
+            try:
+                instruction = """Click on the tab labeled "回复人设" in the settings panel."""
+                success = await self.browser.act(instruction, timeout=10000)
+                if success:
+                    self.logger.info("  [OK] 通过AI点击'回复人设'标签")
+                    return True
+            except:
+                pass
+
+            return False
+
+        except Exception as e:
+            self.logger.error(f"  点击'回复人设'标签失败: {str(e)}")
+            return False
+
+    async def _input_persona_prompt(self, prompt_content: str) -> bool:
+        """在文本框中输入提示词"""
+        try:
+            # 使用JavaScript直接设置文本框内容
+            result = await self.browser.page.evaluate(f'''() => {{
+                // 查找textarea
+                const textareas = document.querySelectorAll('textarea');
+                for (const ta of textareas) {{
+                    const rect = ta.getBoundingClientRect();
+                    if (rect.width > 100 && rect.height > 50) {{
+                        ta.value = `{prompt_content}`;
+                        ta.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                        ta.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                        return {{ found: true, type: 'textarea' }};
+                    }}
+                }}
+
+                // 查找contenteditable
+                const editables = document.querySelectorAll('[contenteditable="true"]');
+                for (const el of editables) {{
+                    const rect = el.getBoundingClientRect();
+                    if (rect.width > 100 && rect.height > 50) {{
+                        el.innerText = `{prompt_content}`;
+                        el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                        return {{ found: true, type: 'contenteditable' }};
+                    }}
+                }}
+                return {{ found: false }};
+            }}''')
+
+            if result.get('found'):
+                self.logger.info(f"  [OK] 已输入提示词 (type={result['type']})，长度: {len(prompt_content)}")
+                return True
+
+            # 备用方法：使用键盘输入
+            textarea_info = await self.browser.page.evaluate('''() => {
+                const textareas = document.querySelectorAll('textarea');
+                for (const ta of textareas) {
+                    const rect = ta.getBoundingClientRect();
+                    if (rect.width > 100 && rect.height > 50) {
+                        return {
+                            found: true,
+                            left: Math.round(rect.left),
+                            top: Math.round(rect.top),
+                            width: Math.round(rect.width),
+                            height: Math.round(rect.height)
+                        };
+                    }
+                }
+                return { found: false };
+            }''')
+
+            if textarea_info.get('found'):
+                self.logger.info(f"  找到文本框，使用键盘输入")
+                x = textarea_info['left'] + textarea_info['width'] // 2
+                y = textarea_info['top'] + textarea_info['height'] // 2
+                await self.browser.page.mouse.click(x, y)
+                await asyncio.sleep(0.5)
+                await self.browser.page.keyboard.press('Control+A')
+                await asyncio.sleep(0.3)
+
+                # 分批输入
+                chunk_size = 200
+                for i in range(0, len(prompt_content), chunk_size):
+                    chunk = prompt_content[i:i+chunk_size]
+                    await self.browser.page.keyboard.type(chunk, delay=10)
+                    await asyncio.sleep(0.3)
+
+                self.logger.info(f"  [OK] 已输入提示词，长度: {len(prompt_content)}")
+                return True
+
+            return False
+
+        except Exception as e:
+            self.logger.error(f"  输入提示词失败: {str(e)}")
+            return False
+
+    async def _click_save_button(self) -> bool:
+        """点击保存按钮"""
+        try:
+            # 使用JavaScript直接点击保存按钮
+            clicked = await self.browser.page.evaluate('''() => {
+                const buttons = document.querySelectorAll('button');
+                for (const btn of buttons) {
+                    const text = (btn.innerText || '').trim();
+                    if (text.includes('保存') || text.includes('确定') || text.includes('确认')) {
+                        btn.click();
+                        return { found: true, text: text };
+                    }
+                }
+                return { found: false };
+            }''')
+
+            if clicked.get('found'):
+                self.logger.info(f"  [OK] 已点击'{clicked['text']}'按钮")
+                await asyncio.sleep(2)
+                return True
+
+            # 备用方法：鼠标点击
+            save_info = await self.browser.page.evaluate('''() => {
+                const buttons = document.querySelectorAll('button');
+                for (const btn of buttons) {
+                    const text = (btn.innerText || '').trim();
+                    const rect = btn.getBoundingClientRect();
+                    if ((text.includes('保存') || text.includes('确定') || text.includes('确认')) &&
+                        rect.width > 0 && rect.height > 0) {
+                        return {
+                            found: true,
+                            text: text,
+                            left: Math.round(rect.left),
+                            top: Math.round(rect.top),
+                            width: Math.round(rect.width),
+                            height: Math.round(rect.height)
+                        };
+                    }
+                }
+                return { found: false };
+            }''')
+
+            if save_info.get('found'):
+                self.logger.info(f"  找到'{save_info['text']}'按钮，使用鼠标点击")
+                x = save_info['left'] + save_info['width'] // 2
+                y = save_info['top'] + save_info['height'] // 2
+                await self.browser.page.mouse.click(x, y)
+                await asyncio.sleep(2)
+                return True
+
+            return False
+
+        except Exception as e:
+            self.logger.error(f"  保存设置失败: {str(e)}")
+            return False
+
+    async def _close_settings_panel(self) -> bool:
+        """关闭设置面板 - 点击右上角的×按钮"""
+        try:
+            self.logger.info("  关闭设置面板...")
+
+            for attempt in range(3):  # 最多尝试3次
+                # 方法1: 使用JavaScript直接点击×关闭按钮
+                closed = await self.browser.page.evaluate('''() => {
+                    // 首先找到设置面板
+                    let panel = null;
+                    const panelSelectors = [
+                        '[class*="Drawer"]', '[class*="drawer"]',
+                        '[class*="Modal"]', '[class*="modal"]',
+                        '[class*="Popover"]', '[class*="popover"]',
+                        '[class*="Panel"]', '[class*="panel"]',
+                        '[role="dialog"]'
+                    ];
+
+                    for (const selector of panelSelectors) {
+                        const panels = document.querySelectorAll(selector);
+                        for (const p of panels) {
+                            const rect = p.getBoundingClientRect();
+                            const text = (p.innerText || '');
+                            // 找到包含"回复人设"或"专题设置"的面板
+                            if (rect.width > 200 && rect.height > 200 &&
+                                (text.includes('回复人设') || text.includes('专题设置') || text.includes('人设'))) {
+                                panel = p;
+                                break;
+                            }
+                        }
+                        if (panel) break;
+                    }
+
+                    // 如果找到了面板，在面板内查找关闭按钮
+                    if (panel) {
+                        const panelRect = panel.getBoundingClientRect();
+
+                        // 在面板右上角区域查找关闭按钮
+                        const allButtons = panel.querySelectorAll('button, [role="button"]');
+                        for (const btn of allButtons) {
+                            const rect = btn.getBoundingClientRect();
+                            const text = (btn.innerText || '').trim();
+
+                            // 检查是否在面板右上角（相对面板右边和上边较近）
+                            const isNearRight = Math.abs(rect.right - panelRect.right) < 60;
+                            const isNearTop = Math.abs(rect.top - panelRect.top) < 60;
+
+                            if (isNearRight && isNearTop && rect.width < 50 && rect.height < 50) {
+                                // 检查是否是关闭按钮（包含×或SVG图标）
+                                const hasX = text === '×' || text === '✕' || text === '✖' || text === 'X' || text === '';
+                                const hasSvg = btn.querySelector('svg') !== null;
+
+                                if (hasX || hasSvg) {
+                                    btn.click();
+                                    return { found: true, method: 'panel_close_btn', position: 'in_panel' };
+                                }
+                            }
+                        }
+
+                        // 查找面板内带有close类名的按钮
+                        const closeBtns = panel.querySelectorAll('[class*="close"], [class*="Close"], [aria-label*="关闭"], [aria-label*="close"]');
+                        for (const btn of closeBtns) {
+                            const rect = btn.getBoundingClientRect();
+                            if (rect.width > 0 && rect.height > 0) {
+                                btn.click();
+                                return { found: true, method: 'close_class', position: 'in_panel' };
+                            }
+                        }
+                    }
+
+                    // 备用：在整个页面查找×按钮
+                    const allButtons = document.querySelectorAll('button, [role="button"]');
+                    for (const btn of allButtons) {
+                        const text = (btn.innerText || '').trim();
+                        if (text === '×' || text === '✕' || text === '✖' || text === 'X') {
+                            const rect = btn.getBoundingClientRect();
+                            if (rect.width > 0 && rect.height > 0) {
+                                btn.click();
+                                return { found: true, method: 'text_x', text: text };
+                            }
+                        }
+                    }
+
+                    // 查找SVG关闭图标（X形状的路径）
+                    const svgs = document.querySelectorAll('svg');
+                    for (const svg of svgs) {
+                        const rect = svg.getBoundingClientRect();
+                        // 查找小的SVG图标
+                        if (rect.width < 30 && rect.height < 30 && rect.width > 10) {
+                            const paths = svg.querySelectorAll('path');
+                            // X图标的path通常包含M和L形成交叉线
+                            let hasCrossPath = false;
+                            for (const path of paths) {
+                                const d = (path.getAttribute('d') || '');
+                                // X图标通常有两条交叉线
+                                if (d.includes('L') && d.length < 100) {
+                                    hasCrossPath = true;
+                                    break;
+                                }
+                            }
+                            if (hasCrossPath || paths.length <= 2) {
+                                const parent = svg.closest('button') || svg.parentElement;
+                                if (parent) {
+                                    parent.click();
+                                    return { found: true, method: 'svg_x', position: 'page' };
+                                }
+                            }
+                        }
+                    }
+
+                    return { found: false };
+                }''')
+
+                if closed.get('found'):
+                    self.logger.info(f"  [OK] 点击关闭按钮 (方法: {closed.get('method', 'unknown')})")
+                    await asyncio.sleep(1)
+
+                    # 验证面板是否已关闭
+                    panel_closed = await self.browser.page.evaluate('''() => {
+                        const allText = document.body.innerText;
+                        const hasPanel = allText.includes('专题设置') && allText.includes('回复人设');
+
+                        // 检查是否还有可见的面板
+                        const panelSelectors = ['[class*="Drawer"]', '[class*="Modal"]', '[role="dialog"]'];
+                        for (const selector of panelSelectors) {
+                            const panels = document.querySelectorAll(selector);
+                            for (const panel of panels) {
+                                const rect = panel.getBoundingClientRect();
+                                const style = window.getComputedStyle(panel);
+                                if (rect.width > 200 && rect.height > 200 &&
+                                    style.display !== 'none' && style.visibility !== 'hidden') {
+                                    return false; // 面板仍然可见
+                                }
+                            }
+                        }
+                        return true; // 面板已关闭
+                    }''')
+
+                    if panel_closed:
+                        self.logger.info("  [OK] 设置面板已成功关闭")
+                        return True
+                    else:
+                        self.logger.warning(f"  面板可能未关闭，重试... (尝试 {attempt + 1}/3)")
+                        await asyncio.sleep(0.5)
+                else:
+                    # 方法2: 使用Escape键
+                    self.logger.info(f"  未找到关闭按钮，使用Escape键 (尝试 {attempt + 1}/3)")
+                    await self.browser.page.keyboard.press('Escape')
+                    await asyncio.sleep(1)
+
+                    # 验证是否关闭
+                    panel_closed = await self.browser.page.evaluate('''() => {
+                        const allText = document.body.innerText;
+                        return !(allText.includes('专题设置') && allText.includes('回复人设'));
+                    }''')
+
+                    if panel_closed:
+                        self.logger.info("  [OK] 设置面板已通过Escape键关闭")
+                        return True
+
+            self.logger.warning("  关闭面板可能未完全成功，但继续执行...")
+            return True
+
+        except Exception as e:
+            self.logger.error(f"  关闭设置面板失败: {str(e)}")
+            # 备用方法
+            try:
+                await self.browser.page.keyboard.press('Escape')
+                await asyncio.sleep(0.5)
+            except:
+                pass
+            return False
 
     async def _navigate_to_metaso(self):
         """导航到总包大脑页面"""
@@ -5060,12 +6312,33 @@ class MetasoAutomation:
         return False
 
     async def _send_question(self, question: str):
-        """使用Stagehand发送问题到总包大脑"""
+        """使用Stagehand发送问题到总包大脑
+
+        【v3.6.2更新】在发送问题前先切换到长思考模式（可配置）
+        """
         self.logger.info(f"发送问题: {question}")
 
         try:
-            # 直接使用默认模型发送问题（不再切换到长思考模式）
-            self.logger.info("使用默认模型，跳过模型选择")
+            # 【v3.6.2】根据配置决定是否切换到长思考模式
+            if self.config.enable_long_thinking:
+                self.logger.info("=" * 50)
+                self.logger.info("步骤1：切换到长思考模式")
+                self.logger.info("=" * 50)
+
+                mode_switched = await self._select_long_thinking_model()
+                if mode_switched:
+                    self.logger.info("✓ 已成功切换到长思考模式")
+                else:
+                    self.logger.warning("⚠ 长思考模式切换失败，将使用当前模式继续")
+
+                # 等待模式切换生效
+                await asyncio.sleep(2)
+            else:
+                self.logger.info("长思考模式未启用，使用默认模式")
+
+            self.logger.info("=" * 50)
+            self.logger.info("步骤2：发送问题到总包大脑")
+            self.logger.info("=" * 50)
 
             # 发送问题
             # 方法1：使用Stagehand的act功能
@@ -5084,97 +6357,204 @@ class MetasoAutomation:
             await self._send_question_fallback(question)
 
     async def _select_long_thinking_model(self):
-        """选择长思考模型（对话框左侧选项）"""
+        """选择长思考模型 - 通过hover触发下拉菜单选择
+
+        【v3.6.2更新】根据实际UI交互模式：
+        1. 找到"快思考"元素（当前模式指示器）
+        2. 鼠标悬停在"快思考"上触发下拉菜单
+        3. 等待下拉菜单出现
+        4. 点击下拉菜单中的"长思考"选项
+        """
         try:
-            self.logger.info("正在选择长思考模型...")
+            self.logger.info("正在切换到长思考模式...")
 
             # 等待页面稳定
             await asyncio.sleep(2)
 
-            # 策略1：使用Stagehand AI识别并点击左侧的长思考选项
-            instruction = """Look at the left side of the chat dialog box. Find and click on the option or button labeled 长思考 (Long Thinking) or r2. This should be a selectable option on the left panel of the conversation interface."""
+            # ===== 策略1：通过hover触发下拉菜单选择 =====
+            # 这是根据实际UI设计的主要交互方式
+            self.logger.info("策略1：通过hover触发下拉菜单选择长思考")
 
-            self.logger.info("策略1：使用Stagehand查找左侧长思考选项")
-            success = await self.browser.act(instruction, timeout=10000)
-
-            if success:
-                self.logger.info("✓ 成功选择长思考模型")
-                await asyncio.sleep(1)  # 等待选择生效
-                return
-
-            # 策略2：使用JavaScript在页面中查找包含"长思考"文本的可点击元素
-            self.logger.info("策略2：使用JavaScript查找长思考选项")
             try:
-                js_code = """
-                // 查找所有包含"长思考"文本的元素
-                const allElements = document.querySelectorAll('*');
-                for (let elem of allElements) {
-                    const text = elem.textContent || elem.innerText || '';
-                    if (text.includes('长思考') || text.includes('r2')) {
-                        // 检查元素是否可点击或是radio/checkbox
-                        const isClickable = elem.tagName === 'INPUT' ||
-                                          elem.tagName === 'LABEL' ||
-                                          elem.onclick !== null ||
-                                          elem.style.cursor === 'pointer';
-                        if (isClickable) {
-                            elem.click();
-                            return 'clicked';
-                        }
-                    }
-                }
-                return 'not_found';
-                """
+                # 1.1 找到"快思考"元素
+                fast_thinking_selectors = [
+                    'span:has-text("快思考")',
+                    'div:has-text("快思考")',
+                    'button:has-text("快思考")',
+                    'label:has-text("快思考")',
+                    '[class*="model-selector"]',
+                    '[class*="thinking-mode"]',
+                    '[data-mode="fast"]',
+                    '[class*="fast-thinking"]',
+                ]
 
-                result = await self.browser.page.evaluate(js_code)
-                if result == 'clicked':
-                    self.logger.info("✓ 成功通过JavaScript选择长思考模型")
+                fast_thinking_element = None
+                for selector in fast_thinking_selectors:
+                    try:
+                        # 使用Playwright的locator API
+                        locator = self.browser.page.locator(selector).first
+                        if await locator.count() > 0:
+                            fast_thinking_element = locator
+                            self.logger.info(f"找到快思考元素: {selector}")
+                            break
+                    except:
+                        continue
+
+                if fast_thinking_element:
+                    # 1.2 悬停在"快思考"上触发下拉菜单
+                    self.logger.info("悬停在快思考元素上以触发下拉菜单...")
+                    await fast_thinking_element.hover(timeout=5000)
+                    await asyncio.sleep(1)  # 等待下拉菜单动画
+
+                    # 1.3 查找并点击下拉菜单中的"长思考"选项
+                    long_thinking_selectors = [
+                        'text=长思考',
+                        'span:has-text("长思考")',
+                        'div:has-text("长思考")',
+                        'button:has-text("长思考")',
+                        'li:has-text("长思考")',
+                        'a:has-text("长思考")',
+                        '[data-value="long-thinking"]',
+                        '[data-mode="long"]',
+                        '[class*="long-thinking"]',
+                        '[class*="dropdown"] span:has-text("长思考")',
+                        '[class*="menu"] span:has-text("长思考")',
+                    ]
+
+                    for selector in long_thinking_selectors:
+                        try:
+                            locator = self.browser.page.locator(selector).first
+                            if await locator.count() > 0:
+                                # 确保元素可见
+                                if await locator.is_visible():
+                                    await locator.click(timeout=5000)
+                                    self.logger.info(f"✓ 成功点击长思考选项: {selector}")
+                                    await asyncio.sleep(1)  # 等待选择生效
+
+                                    # 验证是否切换成功
+                                    await asyncio.sleep(0.5)
+                                    self.logger.info("✓ 成功切换到长思考模式")
+                                    return True
+                        except Exception as click_e:
+                            self.logger.debug(f"选择器 {selector} 点击失败: {str(click_e)}")
+                            continue
+
+                    self.logger.warning("下拉菜单中未找到长思考选项，尝试其他策略")
+                else:
+                    self.logger.warning("未找到快思考元素，尝试其他策略")
+
+            except Exception as e:
+                self.logger.warning(f"策略1失败: {str(e)}")
+
+            # ===== 策略2：使用Stagehand AI智能识别 =====
+            self.logger.info("策略2：使用Stagehand AI智能识别")
+            try:
+                instruction = """Look for a dropdown or selector showing "快思考" (Fast Thinking) or current model. Hover over it to open a dropdown menu, then click on "长思考" (Long Thinking) option in the dropdown."""
+
+                success = await self.browser.act(instruction, timeout=15000)
+                if success:
+                    self.logger.info("✓ 通过Stagehand成功切换到长思考模式")
                     await asyncio.sleep(1)
-                    return
+                    return True
+            except Exception as e:
+                self.logger.warning(f"Stagehand策略失败: {str(e)}")
+
+            # ===== 策略3：使用JavaScript查找并触发下拉菜单 =====
+            self.logger.info("策略3：使用JavaScript触发下拉菜单")
+            try:
+                js_result = await self.browser.page.evaluate('''
+                    () => {
+                        // 查找包含"快思考"的元素
+                        const allElements = document.querySelectorAll('*');
+                        let fastElement = null;
+
+                        for (let elem of allElements) {
+                            const text = elem.textContent || '';
+                            if (text.trim() === '快思考' || text.includes('快思考')) {
+                                // 检查是否是合适的触发元素（不是太大的容器）
+                                if (elem.tagName !== 'BODY' && elem.tagName !== 'HTML') {
+                                    fastElement = elem;
+                                    break;
+                                }
+                            }
+                        }
+
+                        if (fastElement) {
+                            // 创建并触发hover事件
+                            const hoverEvent = new MouseEvent('mouseenter', {
+                                bubbles: true,
+                                cancelable: true,
+                                view: window
+                            });
+                            fastElement.dispatchEvent(hoverEvent);
+
+                            // 也触发mouseover事件
+                            const overEvent = new MouseEvent('mouseover', {
+                                bubbles: true,
+                                cancelable: true,
+                                view: window
+                            });
+                            fastElement.dispatchEvent(overEvent);
+
+                            return 'hovered';
+                        }
+                        return 'not_found';
+                    }
+                ''')
+
+                if js_result == 'hovered':
+                    await asyncio.sleep(1)
+
+                    # 尝试点击长思考
+                    js_click = await self.browser.page.evaluate('''
+                        () => {
+                            const allElements = document.querySelectorAll('*');
+                            for (let elem of allElements) {
+                                const text = elem.textContent || '';
+                                if (text.trim() === '长思考' || (text.includes('长思考') && text.length < 20)) {
+                                    elem.click();
+                                    return 'clicked';
+                                }
+                            }
+                            return 'not_found';
+                        }
+                    ''')
+
+                    if js_click == 'clicked':
+                        self.logger.info("✓ 通过JavaScript成功切换到长思考模式")
+                        await asyncio.sleep(1)
+                        return True
+
             except Exception as e:
                 self.logger.warning(f"JavaScript策略失败: {str(e)}")
 
-            # 策略3：尝试多种可能的选择器（包括左侧面板）
-            self.logger.info("策略3：尝试多种选择器定位长思考选项")
-            selectors = [
-                # 左侧面板可能的选择器
-                '[class*="sidebar"] [class*="thinking"]',
-                '[class*="panel"] [class*="thinking"]',
-                '[class*="left"] [class*="option"]',
-                '[class*="chat"] [class*="left"]',
-                # 通用选择器
-                'input[type="radio"][value="r2"]',
-                'input[type="radio"][id*="r2"]',
-                'input[type="radio"][name*="thinking"]',
-                'input[type="radio"][name*="model"]',
-                # 文本包含选择器
-                'label:has-text("长思考")',
-                'div:has-text("长思考")',
-                'span:has-text("长思考")',
-                'button:has-text("长思考")',
-                # 类名包含
-                '[class*="long"] [class*="thinking"]',
-                '[class*="slow"] [class*="thinking"]',
-                # 数据属性
-                '[data-thinking*="long"]',
-                '[data-model*="r2"]',
-                '[data-value*="r2"]'
+            # ===== 策略4：直接查找并点击长思考元素（备用） =====
+            self.logger.info("策略4：直接查找长思考元素")
+            direct_selectors = [
+                'input[type="radio"][value*="long"]',
+                'input[type="radio"][value*="r2"]',
+                '[class*="model-option"]:has-text("长思考")',
+                '[role="menuitem"]:has-text("长思考")',
+                '[role="option"]:has-text("长思考")',
             ]
 
-            for selector in selectors:
+            for selector in direct_selectors:
                 try:
-                    element = await self.browser.page.wait_for_selector(selector, timeout=2000)
-                    if element:
-                        await element.click()
-                        self.logger.info(f"✓ 成功选择长思考模型 (选择器: {selector})")
+                    locator = self.browser.page.locator(selector).first
+                    if await locator.count() > 0 and await locator.is_visible():
+                        await locator.click(timeout=3000)
+                        self.logger.info(f"✓ 通过直接选择器切换到长思考: {selector}")
                         await asyncio.sleep(1)
-                        return
+                        return True
                 except:
                     continue
 
-            self.logger.warning("未找到长思考选项，将使用默认模型")
+            self.logger.warning("所有策略均未成功切换到长思考模式，将使用默认模式")
+            return False
 
         except Exception as e:
             self.logger.warning(f"选择长思考模型时出错: {str(e)}，将使用默认模型")
+            return False
 
     async def _send_question_fallback(self, question: str):
         """
@@ -6118,19 +7498,32 @@ class MetasoAutomation:
             return None
 
     async def _wait_for_answer(self) -> Optional[str]:
-        """等待并获取总包大脑的回答"""
-        self.logger.info(f"等待总包大脑回答，最长等待时间: {self.config.max_wait_time} 秒")
+        """等待并获取总包大脑的回答
+
+        【v3.6.2更新】长思考模式下使用更长的等待时间
+        """
+        # 【v3.6.2】根据是否启用长思考模式调整等待参数
+        if self.config.enable_long_thinking:
+            # 长思考模式：使用更长的等待时间
+            max_wait = max(self.config.max_wait_time, 900)  # 至少15分钟
+            min_wait_time = 60  # 最小等待60秒后再开始稳定性检查
+            required_stable_count = 10  # 增加到10次，更保守的判定
+            self.logger.info(f"等待总包大脑回答（长思考模式），最长等待时间: {max_wait} 秒")
+        else:
+            # 普通模式：使用默认等待时间
+            max_wait = self.config.max_wait_time
+            min_wait_time = 30  # 最小等待30秒后再开始稳定性检查
+            required_stable_count = 6  # 6次稳定性检查
+            self.logger.info(f"等待总包大脑回答，最长等待时间: {max_wait} 秒")
 
         start_time = time.time()
         previous_content = ""
         stable_count = 0
-        required_stable_count = 6  # 增加到6次，更保守的判定
-        min_wait_time = 30  # 最小等待30秒后再开始稳定性检查
         max_content_length = 0
         content_growth_stopped = False
         no_growth_count = 0
 
-        while time.time() - start_time < self.config.max_wait_time:
+        while time.time() - start_time < max_wait:
             try:
                 current_content = await self._extract_current_answer()
 
@@ -6473,20 +7866,19 @@ class WeChatDraftManager:
             self.logger.error(f"上传封面图片失败: {str(e)}")
             return ""
 
-    def upload_permanent_material(self, image_path: str) -> str:
+    def upload_permanent_material(self, image_path: str, max_retries: int = 3) -> str:
         """上传永久素材（用于广告图，带压缩）
 
         Args:
             image_path: 图片路径
+            max_retries: 最大重试次数（默认3次）
 
         Returns:
-            素材URL或空字符串
+            素材URL或空字符串（失败时返回空字符串，调用方应跳过广告图插入）
         """
         if not os.path.exists(image_path):
-            self.logger.warning(f"广告图片不存在: {image_path}")
+            self.logger.warning(f"广告图片不存在: {image_path}，将跳过广告图插入")
             return ""
-
-        self.logger.info(f"上传广告图片为永久素材: {image_path}")
 
         # 先压缩图片
         compressed_path = self.compress_image(image_path)
@@ -6496,37 +7888,56 @@ class WeChatDraftManager:
 
         url = f"https://api.weixin.qq.com/cgi-bin/material/add_material?access_token={self.access_token}"
 
-        try:
-            with open(compressed_path, 'rb') as f:
-                files = {'media': f}
-                response = requests.post(url, files=files, timeout=60)
-                result = response.json()
+        # 重试机制
+        for attempt in range(1, max_retries + 1):
+            try:
+                self.logger.info(f"上传广告图片为永久素材 (尝试 {attempt}/{max_retries}): {image_path}")
 
-            if 'media_id' in result:
-                self.logger.info(f"成功上传广告图片，media_id: {result['media_id']}")
-                # 微信永久素材API返回格式：{"media_id": MEDIA_ID, "url": URL}
-                # 直接从返回结果中提取URL
-                if 'url' in result and result['url']:
-                    self.logger.info(f"成功获取广告图片URL: {result['url']}")
-                    return result['url']
-                else:
-                    # 如果返回结果中没有URL，尝试通过其他方式获取
-                    image_url = self._get_material_url(result['media_id'])
-                    if image_url:
-                        self.logger.info(f"成功获取广告图片URL: {image_url}")
-                        return image_url
+                with open(compressed_path, 'rb') as f:
+                    files = {'media': f}
+                    response = requests.post(url, files=files, timeout=60)
+                    result = response.json()
+
+                if 'media_id' in result:
+                    self.logger.info(f"✓ 成功上传广告图片，media_id: {result['media_id']}")
+                    # 微信永久素材API返回格式：{"media_id": MEDIA_ID, "url": URL}
+                    # 直接从返回结果中提取URL
+                    if 'url' in result and result['url']:
+                        self.logger.info(f"✓ 成功获取广告图片URL: {result['url']}")
+                        return result['url']
                     else:
-                        # 无法获取URL，返回空字符串（将使用本地路径）
-                        self.logger.warning("无法获取素材URL，将使用本地路径")
+                        # 如果返回结果中没有URL，尝试通过其他方式获取
+                        image_url = self._get_material_url(result['media_id'])
+                        if image_url:
+                            self.logger.info(f"✓ 成功获取广告图片URL: {image_url}")
+                            return image_url
+                        else:
+                            # 无法获取URL，返回空字符串（将跳过广告图插入）
+                            self.logger.warning("无法获取素材URL，将跳过广告图插入")
+                            return ""
+                else:
+                    error_msg = result.get('errmsg', '未知错误')
+                    error_code = result.get('errcode', 'N/A')
+                    if attempt < max_retries:
+                        self.logger.warning(f"上传广告图片失败 (尝试 {attempt}/{max_retries}): [{error_code}] {error_msg}，准备重试...")
+                        import time
+                        time.sleep(2)  # 等待2秒后重试
+                    else:
+                        self.logger.error(f"上传广告图片失败 (已重试{max_retries}次): [{error_code}] {error_msg}，将跳过广告图插入")
                         return ""
-            else:
-                error_msg = result.get('errmsg', '未知错误')
-                self.logger.warning(f"上传广告图片失败: {error_msg}")
-                return ""
 
-        except Exception as e:
-            self.logger.error(f"上传广告图片失败: {str(e)}")
-            return ""
+            except Exception as e:
+                if attempt < max_retries:
+                    self.logger.warning(f"上传广告图片异常 (尝试 {attempt}/{max_retries}): {str(e)}，准备重试...")
+                    import time
+                    time.sleep(2)  # 等待2秒后重试
+                else:
+                    self.logger.error(f"上传广告图片异常 (已重试{max_retries}次): {str(e)}，将跳过广告图插入")
+                    return ""
+
+        # 所有重试都失败
+        self.logger.error(f"广告图上传失败，已达到最大重试次数({max_retries})，将跳过广告图插入")
+        return ""
 
     def _get_material_url(self, media_id: str) -> str:
         """获取素材的URL
@@ -6639,8 +8050,12 @@ class WeChatDraftManager:
             return image_path
 
     def create_draft(self, title: str, content: str, author: str = None,
-                     digest: str = None, cover_media_id: str = None) -> bool:
-        """创建草稿（支持原创声明）"""
+                     digest: str = None, cover_media_id: str = None) -> str:
+        """创建草稿（支持原创声明）
+
+        Returns:
+            成功返回草稿media_id，失败返回空字符串
+        """
         # 标题长度检查（警告但不截断，由调用方确保标题长度合适）
         if len(title) > 24:
             self.logger.warning(f"标题长度({len(title)}字符)超过建议的24字符，可能会被微信截断")
@@ -6695,7 +8110,7 @@ class WeChatDraftManager:
         # WeChat API content size limit check (approximately 200,000 characters for safety)
         if content_length > 200000:
             self.logger.error(f"HTML内容过长 ({content_length} 字符)，超过微信限制")
-            return False
+            return None
 
         # Log preview of content (first 200 chars)
         self.logger.debug(f"HTML内容预览: {html_content[:200]}")
@@ -6742,14 +8157,22 @@ class WeChatDraftManager:
             # Error response: {'errcode': 40001, 'errmsg': 'error message'}
             if 'errcode' not in result:
                 # No errcode means success
-                media_id = result.get('media_id', 'N/A')
-                self.logger.info(f"✓ 成功创建草稿 (media_id: {media_id})")
-                return True
+                media_id = result.get('media_id', '')
+                if media_id:
+                    self.logger.info(f"✓ 成功创建草稿 (media_id: {media_id})")
+                    return media_id
+                else:
+                    self.logger.error("✗ 创建草稿失败: 响应中未包含media_id")
+                    return None
             elif result['errcode'] == 0:
                 # errcode == 0 also means success
-                media_id = result.get('media_id', 'N/A')
-                self.logger.info(f"✓ 成功创建草稿 (media_id: {media_id})")
-                return True
+                media_id = result.get('media_id', '')
+                if media_id:
+                    self.logger.info(f"✓ 成功创建草稿 (media_id: {media_id})")
+                    return media_id
+                else:
+                    self.logger.error("✗ 创建草稿失败: 响应中未包含media_id")
+                    return None
             else:
                 # Any other errcode value means error
                 error_msg = result.get('errmsg', '未知错误')
@@ -6772,13 +8195,112 @@ class WeChatDraftManager:
                 if str(error_code) in error_hints:
                     self.logger.error(f"错误提示: {error_hints[str(error_code)]}")
 
-                return False
+                return None
 
         except Exception as e:
             self.logger.error(f"创建草稿异常: {str(e)}")
             import traceback
             self.logger.debug(traceback.format_exc())
-            return False
+            return None
+
+    def schedule_publish(self, media_id: str, delay_minutes: int = 15) -> dict:
+        """定时发布草稿
+
+        【重要说明 v3.6.3】
+        微信公众号API不支持通过API设置定时发布时间。
+        freepublish/submit 接口只支持立即发布，publish_time参数无效。
+
+        正确的定时发布方式：
+        1. 创建草稿（已实现）
+        2. 用户在微信公众号后台手动设置定时发布
+        或
+        3. 使用外部定时任务系统（如GitHub Actions）在指定时间调用发布API
+
+        Args:
+            media_id: 草稿的media_id
+            delay_minutes: 延迟发布的分钟数（此参数当前无效，仅用于日志提示）
+
+        Returns:
+            dict: {"success": bool, "publish_id": str, "msg": str}
+        """
+        import time
+
+        self.logger.info(f"📋 准备发布草稿")
+        self.logger.info(f"   media_id: {media_id}")
+        self.logger.warning(f"⚠️ 注意: 微信API不支持定时发布，草稿创建后请手动在后台设置发布时间")
+
+        if not self.access_token:
+            self.get_access_token()
+
+        url = f"https://api.weixin.qq.com/cgi-bin/freepublish/submit?access_token={self.access_token}"
+
+        try:
+            # 【修复v3.6.3】移除不支持的publish_time参数
+            # freepublish/submit API 不支持定时发布，只能立即发布
+            payload = {
+                "media_id": media_id
+                # 注意: publish_time 参数已移除，因为微信API不支持
+            }
+
+            headers = {'Content-Type': 'application/json; charset=utf-8'}
+            json_data = json.dumps(payload, ensure_ascii=False).encode('utf-8')
+
+            self.logger.info(f"发送发布请求到微信API...")
+            response = requests.post(url, data=json_data, headers=headers, timeout=30)
+            result = response.json()
+
+            self.logger.info(f"微信API响应: {result}")
+
+            if 'errcode' not in result or result.get('errcode') == 0:
+                publish_id = result.get('publish_id', 'N/A')
+                msg_id = result.get('msg_data_id', 'N/A')
+                self.logger.info(f"✓ 发布成功!")
+                self.logger.info(f"   publish_id: {publish_id}")
+                return {
+                    "success": True,
+                    "publish_id": publish_id,
+                    "msg_id": msg_id,
+                    "msg": "发布成功"
+                }
+            else:
+                error_msg = result.get('errmsg', '未知错误')
+                error_code = result.get('errcode', 'N/A')
+                self.logger.error(f"✗ 发布失败: errcode={error_code}, errmsg={error_msg}")
+
+                # 常见错误提示
+                error_hints = {
+                    "40001": "access_token失效或无效",
+                    "40007": "media_id无效或过期",
+                    "40160": "草稿不存在",
+                    "40161": "草稿已发布",
+                    "40162": "草稿正在发布中",
+                    "40163": "草稿发布失败",
+                    "40164": "草稿发布超时",
+                    "48001": "API权限不足 - 该公众号可能没有发布权限，请检查公众号后台设置",
+                    "88000": "没有群发权限",
+                    "88001": "草稿内容不符合群发要求",
+                }
+
+                hint = error_hints.get(str(error_code), "")
+                if hint:
+                    self.logger.error(f"错误提示: {hint}")
+
+                return {
+                    "success": False,
+                    "publish_id": None,
+                    "msg": f"发布失败: {error_msg} ({error_code})",
+                    "error_code": error_code
+                }
+
+        except Exception as e:
+            self.logger.error(f"发布请求异常: {str(e)}")
+            import traceback
+            self.logger.debug(traceback.format_exc())
+            return {
+                "success": False,
+                "publish_id": None,
+                "msg": f"发布异常: {str(e)}"
+            }
 
 
 # =============================================================================
@@ -6898,16 +8420,29 @@ class MarkdownToWeChat:
                     self.logger.warning(f"上传底部广告图失败: {str(e)}，将使用本地路径")
                     bottom_ad_url = None
 
-        # 如果获取到微信URL，使用URL；否则使用本地文件名
+        # 如果获取到微信URL，使用URL；否则检查是否复制成功
+        # 注意：如果上传失败（top_ad_url为空），则不插入广告图
         if top_ad_url:
             top_ad_image = top_ad_url
+        elif top_ad_copy_path and os.path.exists(top_ad_copy_path):
+            # 上传失败但有本地副本，仍然可以使用本地路径
+            top_ad_image = "top-ad.jpg"
+            self.logger.info("顶部广告图上传失败，将使用本地路径作为备选")
         else:
-            top_ad_image = "top-ad.jpg" if top_ad_copy_path else None
+            # 完全失败，不插入顶部广告图
+            top_ad_image = None
+            self.logger.warning("顶部广告图插入失败，将跳过顶部广告图")
 
         if bottom_ad_url:
             bottom_ad_image = bottom_ad_url
+        elif bottom_ad_copy_path and os.path.exists(bottom_ad_copy_path):
+            # 上传失败但有本地副本，仍然可以使用本地路径
+            bottom_ad_image = "bottom-ad.jpg"
+            self.logger.info("底部广告图上传失败，将使用本地路径作为备选")
         else:
-            bottom_ad_image = "bottom-ad.jpg" if bottom_ad_copy_path else None
+            # 完全失败，不插入底部广告图
+            bottom_ad_image = None
+            self.logger.warning("底部广告图插入失败，将跳过底部广告图")
 
         # 重新生成markdown内容（使用URL或相对文件名）
         markdown_content = self._answer_to_markdown(
@@ -7191,20 +8726,28 @@ class MarkdownToWeChat:
         Returns:
             仅添加了##和###标题的内容，原文完全保留
         """
-        self.logger.info("正在为内容添加结构化标题（0成本优化版）...")
+        self.logger.info(f"正在为内容添加结构化标题（使用 {self.config.zhipu_model_pro} 免费模型）...")
 
         try:
             from zhipuai import ZhipuAI
             client = ZhipuAI(api_key=self.config.zhipu_api_key)
 
-            # 增强版提示词：更明确的指令，确保免费模型也能正确理解
-            enhanced_system = """你是排版编辑。你的任务是给文章添加Markdown标题。
+            # 增强版提示词：针对 GLM-4.7-Flash 优化，确保免费模型也能高质量完成
+            enhanced_system = """你是专业的排版编辑，擅长为文章添加结构化标题。
 
-严格规则：
-1. 只输出添加了##和###标题后的原文内容
-2. 绝对不能修改、删除、精简原文任何字
-3. 绝对不能在输出中包含本对话的任何指令或说明
-4. 标题要简洁，概括下方段落主题"""
+【核心任务】为文章内容添加层次化的Markdown标题（## 和 ###）
+
+【严格规则 - 必须遵守】
+1. 只输出添加了##和###标题后的原文内容，不添加任何其他文字
+2. 绝对不能修改、删除、精简原文任何字、标点或格式
+3. 绝对不能在输出中包含任何对话指令、说明或注释
+4. 标题要简洁精准，准确概括下方段落的核心主题
+5. 标题层级要合理：## 用于主要章节，### 用于子章节
+
+【质量标准】
+- 原文完整性：100%保留原文
+- 标题准确性：标题能准确概括段落内容
+- 层级合理性：标题层级清晰，逻辑结构分明"""
 
             enhanced_user = f"""给下面的文章内容添加##和###标题。只输出添加标题后的文章内容，不要输出任何其他文字。
 
@@ -7547,18 +9090,30 @@ class MarkdownToWeChat:
 
         # 创建草稿
         self.logger.info("创建草稿...")
-        success = wechat_manager.create_draft(
+        draft_media_id = wechat_manager.create_draft(
             title=title,
             content=html_content,
             digest=digest,
             cover_media_id=cover_media_id
         )
 
-        if not success:
+        if not draft_media_id:
             raise Exception("创建草稿失败")
 
-        # 返回空字符串表示成功创建草稿
-        self.logger.info("✓ 成功创建微信草稿")
+        self.logger.info(f"✓ 成功创建微信草稿 (media_id: {draft_media_id})")
+
+        # 定时发布（如果启用）
+        if self.config.enable_schedule_publish:
+            self.logger.info(f"设置定时发布 (延迟 {self.config.schedule_publish_delay} 分钟)...")
+            publish_result = wechat_manager.schedule_publish(
+                media_id=draft_media_id,
+                delay_minutes=self.config.schedule_publish_delay
+            )
+            if publish_result["success"]:
+                self.logger.info(f"✓ {publish_result['msg']}")
+            else:
+                self.logger.warning(f"⚠ {publish_result['msg']} (草稿已创建，可手动发布)")
+
         return ""
 
     def _sync_to_wechat_draft(self, md_file: str, title: str,
@@ -7619,12 +9174,17 @@ class MarkdownToWeChat:
         env['WECHAT_APP_SECRET'] = self.config.wechat_secret
 
         # 配置智谱AI的API密钥（md2wechat使用OpenAI兼容接口）
-        env['OPENAI_API_KEY'] = '810287c9375844c1a15fc546721cd69c.xnkuiMfecV06kE8q'
+        # 安全修复：从配置文件读取API密钥，不硬编码
+        zhipu_api_key = self.config.zhipu_api_key
+        if not zhipu_api_key:
+            raise ConfigurationError("智谱AI API密钥未配置，请在config.ini中设置")
+
+        env['OPENAI_API_KEY'] = zhipu_api_key
         env['OPENAI_BASE_URL'] = 'https://open.bigmodel.cn/api/paas/v4'
         env['OPENAI_MODEL'] = 'glm-4-flash'
 
         self.logger.info("已配置智谱AI环境变量")
-        self.logger.debug(f"  OPENAI_API_KEY: {env.get('OPENAI_API_KEY')[:20]}...")
+        self.logger.debug(f"  OPENAI_API_KEY: {'*' * 8}[已配置]")
         self.logger.debug(f"  OPENAI_BASE_URL: {env.get('OPENAI_BASE_URL')}")
 
         # 先尝试使用系统默认编码读取输出
@@ -8113,9 +9673,9 @@ H3（三级标题）：
             from zhipuai import ZhipuAI
             client = ZhipuAI(api_key=self.config.zhipu_api_key)
 
-            self.logger.info(f"调用智谱AI {self.config.zhipu_model_pro} 进行专业排版（主题：{theme_name}）...")
+            self.logger.info(f"调用智谱AI {self.config.zhipu_model_pro}（免费）进行专业排版（主题：{theme_name}）...")
 
-            # 增强版系统提示词：超紧凑排版规范
+            # 增强版系统提示词：针对 GLM-4.7-Flash 优化
             enhanced_system = self.config.prompt_html_system_template.format(theme_name=theme_name, theme_desc=theme_desc)
             enhanced_system += """
 
@@ -8145,7 +9705,11 @@ H3（三级标题）：
 2. 禁止添加任何原文中不存在的文字或段落
 3. 禁止修改原文的任何词语、标点或语气
 4. 禁止section多层嵌套，保持扁平结构
-5. 【绝对禁止】在HTML末尾添加任何签名、声明、备注"""
+5. 【绝对禁止】在HTML末尾添加任何签名、声明、备注
+
+【质量控制 - GLM-4.7-Flash优化】
+本提示词已针对GLM-4.7-Flash免费模型优化，通过明确的指令和规则确保输出质量。
+如遇到质量问题，系统会自动重试最多2次。"""
 
             best_html = None
             best_quality_score = 0
@@ -8241,8 +9805,39 @@ H3（三级标题）：
             return html_content
 
         except Exception as e:
-            self.logger.error(f"智谱AI转换失败: {str(e)}")
-            return self._simple_convert(md_file)
+            error_str = str(e)
+            # 【修复v3.6.1】处理速率限制错误（429）
+            if '429' in error_str or '速率限制' in error_str or 'rate limit' in error_str.lower():
+                self.logger.warning(f"⚠️ 智谱AI速率限制，等待30秒后重试...")
+                import time
+                time.sleep(30)  # 等待30秒
+                try:
+                    # 重新尝试一次
+                    from zhipuai import ZhipuAI
+                    client = ZhipuAI(api_key=self.config.zhipu_api_key)
+                    self.logger.info(f"重试调用智谱AI {self.config.zhipu_model_pro}...")
+                    response = client.chat.completions.create(
+                        model=self.config.zhipu_model_pro,
+                        messages=[
+                            {"role": "system", "content": enhanced_system},
+                            {"role": "user", "content": f"""{self.config.prompt_html_user.format(theme_name=theme_name, md_content=processed_md_content)}"""}
+                        ],
+                        temperature=0.2,
+                        max_tokens=16000
+                    )
+                    html_content = response.choices[0].message.content.strip()
+                    self.logger.info("✓ 重试成功！智谱AI转换完成")
+                    # 保存HTML文件
+                    output_file = md_file.replace('.md', '.html')
+                    with open(output_file, 'w', encoding='utf-8') as f:
+                        f.write(html_content)
+                    return html_content
+                except Exception as retry_e:
+                    self.logger.error(f"重试仍然失败: {str(retry_e)}")
+                    return self._simple_convert(md_file)
+            else:
+                self.logger.error(f"智谱AI转换失败: {error_str}")
+                return self._simple_convert(md_file)
 
     def _process_image_for_html(self, img_path: str, md_dir: str) -> str:
         """处理图片并转换为HTML img标签（使用秋日暖光主题专业样式）
@@ -8373,32 +9968,36 @@ class NotificationManager:
         self.config = config
         self.logger = logger
 
-    def send_success_notification(self, question: str, success: bool = True, send_email: bool = False):
+    def send_success_notification(self, question: str, success: bool = True, send_email: bool = False, account_name: str = None):
         """发送任务完成通知
 
         Args:
             question: 热点问题
             success: 任务是否成功
             send_email: 是否发送邮件通知，默认False
+            account_name: 公众号名称（多公众号轮换时使用）
         """
         self.logger.info("发送任务完成通知")
 
         # 始终发送企业微信通知
-        self._send_wechat_notification(question, success)
+        self._send_wechat_notification(question, success, account_name)
 
         # 仅在用户选择时发送邮件通知
         if send_email:
-            self._send_email_notification(question, success)
+            self._send_email_notification(question, success, account_name)
         else:
             self.logger.info("邮件通知已跳过（用户未启用邮件通知）")
 
-    def _send_wechat_notification(self, question: str, success: bool):
+    def _send_wechat_notification(self, question: str, success: bool, account_name: str = None):
         """发送企业微信通知（简化版）"""
         self.logger.info("发送企业微信通知")
 
+        # 使用传入的公众号名称，如果没有则使用默认名称
+        display_name = account_name or "总包之声"
+
         if success:
             # 成功时使用简化格式：总包大脑刚刚回复了这个热点问题：【完整的热点问题】
-            content = f"总包大脑刚刚回复了这个热点问题：\n\n> {question}\n\n✅ 文章已发送到总包之声公众号草稿箱"
+            content = f"总包大脑刚刚回复了这个热点问题：\n\n> {question}\n\n✅ 文章已发送到【{display_name}】公众号草稿箱"
         else:
             # 失败时显示详细信息
             content = f"❌ 总包大脑文章生成任务失败\n\n> {question}\n\n请查看日志了解详情"
@@ -8426,12 +10025,17 @@ class NotificationManager:
         except Exception as e:
             self.logger.error(f"发送企业微信通知失败: {str(e)}")
 
-    def _send_email_notification(self, question: str, success: bool):
+    def _send_email_notification(self, question: str, success: bool, account_name: str = None):
         """发送邮件通知"""
         self.logger.info("发送邮件通知")
 
+        # 使用传入的公众号名称，如果没有则使用默认名称
+        display_name = account_name or "总包之声"
+
         status = "成功" if success else "失败"
         subject = f"【总包大脑】文章生成{status}通知 - {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+
+        success_message = f"✅ 任务已成功完成，文章已发送到【{display_name}】公众号草稿箱，请登录微信公众平台查看和编辑。" if success else "❌ 任务执行失败，请查看日志了解详情。"
 
         content = f"""您好，
 
@@ -8439,11 +10043,13 @@ class NotificationManager:
 
 **状态**: {status}
 
+**目标公众号**: {display_name}
+
 **热点问题**: {question}
 
 **时间**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
-{"✅ 任务已成功完成，文章已发送到总包之声公众号草稿箱，请登录微信公众平台查看和编辑。" if success else "❌ 任务执行失败，请查看日志了解详情。"}
+{success_message}
 
 此致
 ZBBrainArticle 自动化脚本
@@ -8513,6 +10119,8 @@ ZBBrainArticle 自动化脚本
 
         # 计算运行时长（使用北京时间，确保时区一致）
         from datetime import datetime
+        import pytz
+        beijing_tz = pytz.timezone('Asia/Shanghai')
         now = datetime.now(beijing_tz)
         start_time_str = stats.get('start_time', now.isoformat())
         start_dt = datetime.fromisoformat(start_time_str)
@@ -8812,7 +10420,15 @@ class ZBBrainArticleTask:
         self.logger.info(f"开始执行总包大脑文章生成任务 (Stagehand版本) - {mode_name}")
         self.logger.info("=" * 60)
 
-        # 步骤0: 检查微信公众号IP白名单
+        # 步骤0.1: 获取当前要使用的微信公众号配置（支持多公众号轮换）
+        current_account = self.config.get_current_wechat_account()
+        self.logger.info(f"📱 当前目标公众号: {current_account['name']}")
+        self.logger.info(f"   公众号数量: {len(self.config.get_all_wechat_accounts())} 个")
+
+        # 设置当前公众号配置
+        self.config.set_wechat_account(current_account)
+
+        # 步骤0.2: 检查微信公众号IP白名单
         self.logger.info("步骤0: 检查微信公众号IP白名单")
         if not self._check_wechat_ip_whitelist():
             self.logger.error("IP白名单检查失败，项目终止运行")
@@ -8861,9 +10477,21 @@ class ZBBrainArticleTask:
 
             # 步骤3: 发送到总包大脑获取回答
             self.logger.info("步骤3: 发送到总包大脑获取回答")
+
+            # 步骤3.1: 获取当前回复人设提示词
+            current_prompt = self.config.get_current_prompt()
+            prompt_content = current_prompt.get('content', '')
+            prompt_name = current_prompt.get('name', '默认版')
+
+            if prompt_content:
+                self.logger.info(f"📝 当前回复人设: {prompt_name}")
+                self.logger.info(f"   提示词长度: {len(prompt_content)} 字符")
+            else:
+                self.logger.info("使用默认回复人设（未配置自定义提示词）")
+
             metaso = MetasoAutomation(self.config, self.logger)
             try:
-                answer = await metaso.send_question_and_get_answer(question)
+                answer = await metaso.send_question_and_get_answer(question, prompt_content=prompt_content)
 
                 if not answer:
                     self.logger.error("=" * 60)
@@ -8909,12 +10537,26 @@ class ZBBrainArticleTask:
                     # 步骤5: 发送成功通知
                     self.logger.info("步骤5: 发送成功通知")
                     notifier = NotificationManager(self.config, self.logger)
-                    # 使用原始热点问题作为通知内容
-                    notifier.send_success_notification(question, success=True, send_email=send_email)
+                    # 使用原始热点问题作为通知内容，并包含公众号信息
+                    notifier.send_success_notification(
+                        question,
+                        success=True,
+                        send_email=send_email,
+                        account_name=current_account['name']
+                    )
 
                     self.logger.info("=" * 60)
-                    self.logger.info("任务执行成功")
+                    self.logger.info(f"✓ 任务执行成功 - 已推送到公众号: {current_account['name']}")
                     self.logger.info("=" * 60)
+
+                    # 轮换到下一个公众号（为下次运行做准备）
+                    next_account = self.config.rotate_to_next_wechat_account()
+                    self.logger.info(f"🔄 下次运行将推送到: {next_account['name']}")
+
+                    # 轮换到下一个回复人设提示词（为下次运行做准备）
+                    next_prompt = self.config.rotate_to_next_prompt()
+                    self.logger.info(f"🎨 下次运行将使用回复人设: {next_prompt['name']}")
+
                     return True
 
                 # 回退到传统流程（如果sync-md失败）
@@ -8928,34 +10570,72 @@ class ZBBrainArticleTask:
                 # 步骤6: 创建微信公众号草稿
                 self.logger.info("步骤6: 创建微信公众号草稿")
                 # 使用原始热点问题作为摘要
-                success = wechat_manager.create_draft(
+                draft_media_id = wechat_manager.create_draft(
                     title=catchy_title,
                     content=html_content,
                     digest=question,  # 使用原始热点问题作为摘要
                     cover_media_id=cover_media_id
                 )
 
-                if not success:
+                if not draft_media_id:
                     self.logger.error("创建草稿失败")
                     notifier = NotificationManager(self.config, self.logger)
                     # 使用原始热点问题作为通知内容
                     notifier.send_success_notification(question, success=False, send_email=send_email)
                     return False
 
+                self.logger.info(f"✓ 成功创建微信草稿 (media_id: {draft_media_id})")
+
+                # 步骤6.5: 定时发布（如果启用）
+                if self.config.enable_schedule_publish:
+                    self.logger.info(f"步骤6.5: 设置定时发布 (延迟 {self.config.schedule_publish_delay} 分钟)")
+                    publish_result = wechat_manager.schedule_publish(
+                        media_id=draft_media_id,
+                        delay_minutes=self.config.schedule_publish_delay
+                    )
+                    if publish_result["success"]:
+                        self.logger.info(f"✓ {publish_result['msg']}")
+                    else:
+                        self.logger.warning(f"⚠ {publish_result['msg']} (草稿已创建，可手动发布)")
+
                 # 步骤7: 发送成功通知
                 self.logger.info("步骤7: 发送成功通知")
                 notifier = NotificationManager(self.config, self.logger)
-                # 使用原始热点问题作为通知内容
-                notifier.send_success_notification(question, success=True, send_email=send_email)
+                # 使用原始热点问题作为通知内容，并包含公众号信息
+                notifier.send_success_notification(
+                    question,
+                    success=True,
+                    send_email=send_email,
+                    account_name=current_account['name']
+                )
 
                 self.logger.info("=" * 60)
-                self.logger.info("任务执行成功")
+                self.logger.info(f"✓ 任务执行成功 - 已推送到公众号: {current_account['name']}")
                 self.logger.info("=" * 60)
+
+                # 轮换到下一个公众号（为下次运行做准备）
+                next_account = self.config.rotate_to_next_wechat_account()
+                self.logger.info(f"🔄 下次运行将推送到: {next_account['name']}")
+
+                # 轮换到下一个回复人设提示词（为下次运行做准备）
+                next_prompt = self.config.rotate_to_next_prompt()
+                self.logger.info(f"🎨 下次运行将使用回复人设: {next_prompt['name']}")
 
                 return True
 
             except Exception as e:
                 self.logger.error(f"任务执行失败: {str(e)}")
+
+                # 【修复】即使任务失败也要轮换公众号和提示词，避免某个公众号被反复重试
+                try:
+                    next_account = self.config.rotate_to_next_wechat_account()
+                    self.logger.info(f"🔄 任务失败但仍轮换公众号，下次运行将推送到: {next_account['name']}")
+
+                    next_prompt = self.config.rotate_to_next_prompt()
+                    self.logger.info(f"🎨 下次运行将使用回复人设: {next_prompt['name']}")
+                except Exception as rotate_error:
+                    self.logger.warning(f"轮换公众号/提示词时出错: {str(rotate_error)}")
+
                 return False
             finally:
                 # 关闭总包大脑浏览器
@@ -9018,7 +10698,29 @@ def main():
 
     # 输出配置信息
     logger.info("=" * 60)
-    logger.info("ZBBrain-Write v3.3.0 (Theme Rotation Edition)")
+    logger.info("ZBBrain-Write v3.6.0 (Zero-Cost AI Edition)")
+    logger.info("=" * 60)
+
+    # 【0成本优化 V2.0】显示模型配置和成本优化状态
+    logger.info(f"🤖 AI模型配置:")
+    logger.info(f"   低成本模型: {temp_config.zhipu_model_fast}")
+    logger.info(f"   高质量模型: {temp_config.zhipu_model_pro}")
+    logger.info(f"   图片生成模型: {temp_config.image_model}")
+
+    # 检查是否使用免费模型
+    free_models = ['glm-4-flash', 'glm-4.7-flash', 'glm-4.5-flash', 'glm-4.6v-flash']
+    is_free_setup = (temp_config.zhipu_model_fast in free_models and
+                     temp_config.zhipu_model_pro in free_models)
+
+    if is_free_setup:
+        logger.info("💰 成本优化: ✅ 已启用 0成本模式 (使用免费AI模型)")
+        logger.info("   GLM-4.7-Flash: 200K上下文, 同级别最强能力, 完全免费")
+    else:
+        logger.info("💰 成本优化: ⚠️ 使用付费模型 (可在config.ini切换到免费模型)")
+        logger.info("   推荐: glm-4.7-flash (免费, 高质量)")
+
+    logger.info("=" * 60)
+
     if temp_config.enable_theme_rotation:
         logger.info(f"🎨 文章主题: {temp_config.article_theme} (md2wechat: {temp_config.md2wechat_theme}) [轮换模式]")
         logger.info(f"   本次主题由自动轮换选择，下次将更换为不同风格")
@@ -9241,10 +10943,23 @@ def run_scheduler(config: Config, logger: Logger, keyword: str, max_pages: int,
                     logger.info("🚀 开始执行任务...")
 
                     # 每次运行都重新创建task，以触发主题轮换
+                    # 【修复v3.6.1】只创建一个Config实例，避免多次创建导致轮换状态混乱
                     fresh_config = Config(config.config_file)
                     if fresh_config.enable_theme_rotation:
                         logger.info(f"🎨 本次主题: {fresh_config.article_theme} (md2wechat: {fresh_config.md2wechat_theme})")
+
+                    # 【修复v3.6.1】获取并锁定当前公众号配置，确保本轮运行使用同一个公众号
+                    current_wechat_account = fresh_config.get_current_wechat_account()
+                    logger.info(f"📱 当前目标公众号: {current_wechat_account['name']}")
+                    logger.info(f"   公众号数量: {len(fresh_config.get_all_wechat_accounts())} 个")
+
+                    # 设置当前公众号配置（锁定）
+                    fresh_config.set_wechat_account(current_wechat_account)
+                    logger.info(f"✓ 已锁定公众号配置: AppID {current_wechat_account['appid'][:8]}...")
+
                     task = ZBBrainArticleTask(config.config_file)
+                    # 【修复v3.6.1】将锁定的公众号配置同步到task的config
+                    task.config.set_wechat_account(current_wechat_account)
 
                     # 先检测网络环境（v3.5.0 新增）
                     is_china, ip, country, network_msg = task._check_china_network()
@@ -9285,7 +11000,7 @@ _总包大脑自动写作系统 v3.5.0_"""
 
                         # 等待30分钟后重试
                         wait_seconds = 30 * 60  # 30分钟
-                        next_retry = now_beijing + timedelta(minutes=30)
+                        next_retry = datetime.now(beijing_tz) + timedelta(minutes=30)
                         stats_tracker.set_next_run(next_retry)
                         logger.info(f"⏭️ 下次网络检测时间: {next_retry.strftime('%Y-%m-%d %H:%M:%S')} (北京时间)")
                         logger.info(f"😴 等待 30 分钟后重新检测网络环境...")
@@ -9341,7 +11056,7 @@ _总包大脑自动写作系统 v3.5.0_"""
 
                         # 等待2小时后重试
                         wait_seconds = 2 * 3600  # 2小时
-                        next_retry = now_beijing + timedelta(hours=2)
+                        next_retry = datetime.now(beijing_tz) + timedelta(hours=2)
                         stats_tracker.set_next_run(next_retry)
                         logger.info(f"⏭️ 下次重试时间: {next_retry.strftime('%Y-%m-%d %H:%M:%S')} (北京时间)")
                         logger.info(f"😴 等待 2 小时后重新检查IP白名单...")
@@ -9402,7 +11117,9 @@ _总包大脑自动写作系统 v3.5.0_"""
                     first_run = False
 
                     # 计算下次运行时间
-                    next_run = now_beijing + timedelta(hours=config.run_frequency_hours)
+                    # 【修复v3.6.3】使用当前时间而非任务开始时的时间，确保间隔正确
+                    current_time_for_next_run = datetime.now(beijing_tz)
+                    next_run = current_time_for_next_run + timedelta(hours=config.run_frequency_hours)
                     stats_tracker.set_next_run(next_run)
                     logger.info(f"⏭️ 下次运行时间: {next_run.strftime('%Y-%m-%d %H:%M:%S')} (北京时间)")
 

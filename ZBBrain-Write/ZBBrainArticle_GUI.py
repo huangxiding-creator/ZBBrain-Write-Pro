@@ -415,12 +415,29 @@ class SettingsWindow:
         """创建微信公众号配置页"""
         fields = [
             {"type": "group", "label": "📱 微信公众号", "key": "wechat"},
+            {"key": "公众号配置文件", "label": "多公众号配置:", "type": "text"},
             {"key": "appid", "label": "AppID:", "type": "text"},
             {"key": "appsecret", "label": "AppSecret:", "type": "password"},
             {"key": "封面图片路径", "label": "封面图片路径:", "type": "text"},
             {"key": "默认作者", "label": "默认作者:", "type": "text"},
         ]
         frame = self.create_config_page(self.notebook, "微信公众号", fields)
+
+        # 添加多公众号配置说明
+        info_frame = tk.Frame(frame, bg=self.COLORS["bg_panel"])
+        info_frame.pack(fill=tk.X, padx=20, pady=10)
+
+        info_label = tk.Label(
+            info_frame,
+            text="💡 提示: 多公众号轮换功能已启用，请在 wechat_accounts.json 中配置所有公众号\n"
+                 "     每次运行将自动轮换到下一个公众号进行推送",
+            font=("Microsoft YaHei UI", 9),
+            fg=self.COLORS["text_secondary"],
+            bg=self.COLORS["bg_panel"],
+            justify=tk.LEFT
+        )
+        info_label.pack(anchor=tk.W)
+
         self.notebook.add(frame, text="  微信公众号  ")
 
     def create_workwx_tab(self):

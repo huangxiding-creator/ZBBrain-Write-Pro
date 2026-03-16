@@ -21,17 +21,31 @@
 # 浏览器用户数据目录
 用户数据目录 = ./browser_data
 # 等待回复的最长时间（秒）
-最大等待回复时间 = 600
+# 【v3.6.2更新】长思考模式下会自动延长到至少900秒(15分钟)
+最大等待回复时间 = 900
 # 检查回复的间隔时间（秒）
 回复检查间隔 = 5
+# 回复人设提示词轮换配置（在 Prompt 文件夹中放置不同版本的提示词）
+提示词轮换配置文件 = ./prompt_rotation.json
+提示词文件夹 = ./Prompt
+# 【v3.6.2新增】长思考模式配置
+# 是否在发送问题前切换到长思考模式（true/false）
+# 长思考模式可获得更详细、更深度的回复，但响应时间更长
+启用长思考模式 = true
 
 [智谱AI]
 # 智谱AI API配置（需要替换为您的API Key）
 api key = YOUR_ZHIPU_API_KEY
 api 地址 = https://open.bigmodel.cn/api/paas/v4/chat/completions
-# 模型配置
-低成本模型名称 = glm-4-plus
-高质量模型名称 = glm-4-plus
+# 模型配置【0成本优化 V2.0】
+# 推荐使用 GLM-4.7-Flash: 200K上下文，同级别最强能力，完全免费！
+# 可选模型:
+#   - glm-4.7-flash (推荐): 完全免费，200K上下文，最强通用能力
+#   - glm-4-flash: 完全免费，128K上下文
+#   - glm-4-plus: 付费模型，如需极致质量可选用
+低成本模型名称 = glm-4.7-flash
+高质量模型名称 = glm-4.7-flash
+# 图片生成模型 (cogview-3-flash 免费)
 图片生成模型 = cogview-3-flash
 # 生成问题的最小字符数
 问题最小字符数 = 50
@@ -40,16 +54,28 @@ api 地址 = https://open.bigmodel.cn/api/paas/v4/chat/completions
 
 [微信公众号]
 # 公众号配置（需要替换为您的公众号配置）
+# 注意：多公众号轮换功能已启用，请在 wechat_accounts.json 中配置所有公众号
+# 配置文件路径（默认为 ./wechat_accounts.json）
+公众号配置文件 = ./wechat_accounts.json
+# 以下为默认公众号配置（当 wechat_accounts.json 不存在时使用）
 appid = YOUR_WECHAT_APPID
 appsecret = YOUR_WECHAT_APPSECRET
 # 封面图片路径
 封面图片路径 = ./cover.jpg
+# 封面轮换状态文件
+封面轮换状态文件 = ./cover_rotation.json
 # 默认作者名称
 默认作者 = 总包大脑
 # 是否标记为原创（1=原创，0=非原创）
 声明原创 = 1
 # 是否开启评论（1=开启，0=关闭）
 开启评论 = 1
+# 定时发布设置
+# 注意：微信API不支持通过API设置定时发布，需手动在公众号后台设置
+# 此选项暂不可用
+启用定时发布 = false
+# 定时发布延迟分钟数（草稿创建后多少分钟发布）
+定时发布延迟分钟 = 15
 
 [文章主题]
 # 可用主题：

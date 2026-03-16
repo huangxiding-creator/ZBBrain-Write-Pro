@@ -1,22 +1,50 @@
 # ZBBrainArticle .gitignore
 
+# ========================================
 # Configuration files with sensitive data
+# ========================================
 config.ini
 *.ini
+!config.ini.example
 
-# Browser data
+# Credentials and secrets (CRITICAL)
+wechat_accounts.json
+!wechat_accounts.example.json
+*.secret
+*.key
+*.pem
+.env
+.env.*
+
+# ========================================
+# Browser and Session data
+# ========================================
 browser_data/
 .user_data/
+playwright-data/
+.browser/
+cache/
 
-# Logs
+# ========================================
+# Logs and Debug
+# ========================================
 *.log
 logs/
+debug/
+zbbrain_article.log
 
+# ========================================
 # Temporary files
+# ========================================
 temp/
 tmp/
+*.tmp
+*.temp
+*.bak
 
+# ========================================
 # Python
+# ========================================
 __pycache__/
 *.py[cod]
 *$py.class
@@ -37,26 +65,100 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+MANIFEST
 
+# ========================================
 # Virtual environments
+# ========================================
 venv/
 ENV/
 env/
+.venv/
+.envrc
 
-# IDE
+# ========================================
+# IDE and Editors
+# ========================================
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
+.project
+.pydevproject
+.settings/
 
-# OS
+# ========================================
+# OS Generated
+# ========================================
 .DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
 Thumbs.db
+Desktop.ini
 
-# Cover images (optional)
+# ========================================
+# Cover images (user-specific)
+# ========================================
 cover.jpg
 cover.png
+cover2.jpg
+cover2.png
+image/top-ad.jpg
+image/bottom-image.jpg
 
-# Session data
+# ========================================
+# Session and Cache
+# ========================================
 *.session
+*.sqlite
+*.db
+.cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ========================================
+# Test Coverage
+# ========================================
+htmlcov/
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+.pytest_cache/
+
+# ========================================
+# Jupyter Notebooks
+# ========================================
+.ipynb_checkpoints
+
+# ========================================
+# Distribution / Packaging
+# ========================================
+.eggs/
+*.egg
+*.egg-info/
+dist/
+build/
+sdist/
+wheels/
+
+# ========================================
+# Playwright
+# ========================================
+ms-playwright/
+playwright-core/
+
+# ========================================
+# Portable environment
+# ========================================
+portable/
+

@@ -1,0 +1,22 @@
+{
+    "accounts": [
+        {
+            "name": "公众号名称1",
+            "appid": "YOUR_WECHAT_APPID_1",
+            "appsecret": "YOUR_WECHAT_APPSECRET_1",
+            "default_author": "默认作者名",
+            "enabled": true
+        },
+        {
+            "name": "公众号名称2",
+            "appid": "YOUR_WECHAT_APPID_2",
+            "appsecret": "YOUR_WECHAT_APPSECRET_2",
+            "default_author": "默认作者名",
+            "enabled": true
+        }
+    ],
+    "rotation": {
+        "current_index": 0,
+        "last_updated": "2024-01-01T00:00:00.000000"
+    }
+}

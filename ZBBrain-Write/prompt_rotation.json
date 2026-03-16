@@ -1,0 +1,28 @@
+{
+    "prompts": [
+        {
+            "name": "麦肯锡版",
+            "file": "总包大脑麦肯锡版提示词20260313.md",
+            "enabled": true
+        },
+        {
+            "name": "刘润版",
+            "file": "总包大脑刘润版提示词20260315.md",
+            "enabled": true
+        },
+        {
+            "name": "逻辑思维版",
+            "file": "总包大脑逻辑思维版提示词20260315.md",
+            "enabled": true
+        },
+        {
+            "name": "简要版",
+            "file": "总包大脑简要版提示词20260315.md",
+            "enabled": true
+        }
+    ],
+    "rotation": {
+        "current_index": 2,
+        "last_updated": "2026-03-16T11:58:10.992204"
+    }
+}
