@@ -5455,6 +5455,7 @@ class ZhipuAIAnalyzer:
         # 确保re模块可用（修复作用域问题）
         import re
         import random
+        import time
 
         # 输入验证
         if not question or not isinstance(question, str):
@@ -5477,232 +5478,187 @@ class ZhipuAIAnalyzer:
 
         # 备用标题模板（仅在AI生成失败时使用）- 紧扣具体场景、包含感叹号（28-30字）
         title_templates = [
-            # 设计变更场景
             "EPC设计变更索赔90%的人都做错这3点！后果真的很严重",
             "别让设计变更毁了你的EPC项目！这4招帮你有效规避风险",
-            "设计变更频繁的EPC项目如何控成本？这4招非常关键！",
-
-            # 分包管理场景
             "EPC分包商违约怎么办？这5个合同条款必须提前看清！",
-            "EPC分包管理的残酷真相终于揭秘！这3个坑一定要避开",
-            "EPC联合体投标利润分配5种常见问题！必须提前规避！",
-
-            # 成本控制场景
             "EPC项目成本失控？这5个真相终于大揭秘！速看",
             "掌握这4招让EPC项目利润直接提升30%！非常实用",
-            "EPC总承包成本超支5大原因揭秘！这样规避最有效",
-
-            # 合同风险场景
             "EPC合同这3个条款不看清后果真的很严重！必须警惕",
-            "EPC总承包合同管理5个致命漏洞！一定要提前规避",
-            "EPC项目结算前必查这5个问题！少查一个都可能亏损",
-
-            # 风险管理场景
             "EPC项目风险管理这3个关键点必须牢牢掌握！非常重要",
-            "警惕EPC项目中隐藏的致命风险隐患！这5点不可不防",
-            "EPC总承包千万别再犯这些低级错误！后果真的很严重",
-
-            # 工期管理场景
             "EPC项目工期延误怎么办？这4个应对策略非常关键！",
-            "为什么EPC项目总是延期？这5个原因终于搞清楚了！",
-
-            # 质量控制场景
-            "EPC项目质量控制这3个环节最容易出问题！必须重点把控",
-            "EPC总承包质量验收5个常见问题！一定要提前预防"
         ]
 
-        # 构建关键词要求（如果有搜索关键词）
+        def _clean_title(raw_title: str) -> str:
+            """清理标题的辅助函数"""
+            if not raw_title:
+                return ""
+            # 移除编号前缀
+            cleaned = re.sub(r'^[\d\.\、\s]+', '', raw_title)
+            # 移除常见标记
+            for prefix in ['标题：', '【最佳】', '最佳：', '推荐：', '爆款：', '答案：']:
+                if cleaned.startswith(prefix):
+                    cleaned = cleaned[len(prefix):].strip()
+            # 移除引号和特殊符号
+            for char in '"''《》【】#*「」『』\n\r\t':
+                cleaned = cleaned.replace(char, '')
+            # 移除结尾标点（保留感叹号）
+            cleaned = re.sub(r'[，。、：:,]$', '', cleaned)
+            return cleaned.strip()
+
+        # 构建关键词要求
         keyword_requirement = ""
         if keyword:
             keyword_requirement = f"""
 【关键词强制要求】
 标题必须包含搜索关键词「{keyword}」，这是文章的核心主题，不能遗漏！"""
 
-        try:
-            response = self.client.chat.completions.create(
-                model=self.config.zhipu_model_title,  # 【0成本优化】使用免费模型 + 优化提示词生成爆款标题
-                messages=[
-                    {
-                        "role": "system",
-                        "content": self.config.prompt_title_system  # 从配置文件读取
-                    },
-                    {
-                        "role": "user",
-                        "content": self.config.prompt_title_user.format(
-                            question=question,
-                            content=content_for_analysis,
-                            keyword_requirement=keyword_requirement
-                        )
-                    }
-                ],
-                temperature=0.9,
-                max_tokens=60,  # 增加token以支持更长的标题（最多30汉字）
-                timeout=Constants.API_CALL_TIMEOUT  # 【v3.6.4修复】添加API调用超时
-            )
+        # 【v3.6.10修复】增强的重试机制 - 解决AI返回空的问题
+        MAX_TITLE_RETRIES = 5  # 增加到5次重试
+        title = ""
+        last_error = None
 
-            title = response.choices[0].message.content.strip()
-            self.logger.info(f"AI原始输出: {title}")
+        for retry in range(MAX_TITLE_RETRIES):
+            try:
+                self.logger.info(f"📍 标题生成尝试 {retry + 1}/{MAX_TITLE_RETRIES}")
 
-            # 清理可能的标记和前缀
-            # 移除可能的编号前缀
-            title = re.sub(r'^[\d\.\、\s]+', '', title)
+                # 【v3.6.10优化】根据重试次数调整参数
+                current_temp = 0.9 - (retry * 0.1)  # 逐次降低温度，获得更稳定输出
+                current_temp = max(0.5, current_temp)
 
-            # 移除常见的标记
-            for prefix in ['标题：', '【最佳】', '最佳：', '推荐：', '爆款：', '答案：']:
-                if title.startswith(prefix):
-                    title = title[len(prefix):].strip()
+                response = self.client.chat.completions.create(
+                    model=self.config.zhipu_model_title,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": self.config.prompt_title_system
+                        },
+                        {
+                            "role": "user",
+                            "content": self.config.prompt_title_user.format(
+                                question=question,
+                                content=content_for_analysis,
+                                keyword_requirement=keyword_requirement
+                            )
+                        }
+                    ],
+                    temperature=current_temp,
+                    max_tokens=300,  # 【v3.6.10修复】从100增加到300，确保模型有足够空间输出最终结果
+                    timeout=Constants.API_CALL_TIMEOUT
+                )
 
-            # 移除引号和特殊符号（但保留中文内容）
-            for char in '"''《》【】#*「」『』\n\r\t':
-                title = title.replace(char, '')
+                # 【v3.6.10增强】全面的响应验证
+                if not response:
+                    self.logger.warning(f"⚠️ API响应为None，重试中...")
+                    last_error = "API响应为None"
+                    continue
 
-            # 移除结尾的标点符号（但保留感叹号！增强情感冲击力）
-            title = re.sub(r'[，。、：:,]$', '', title)
+                if not hasattr(response, 'choices') or not response.choices:
+                    self.logger.warning(f"⚠️ API响应无效：choices为空")
+                    last_error = "choices为空"
+                    continue
 
-            title = title.strip()
-            self.logger.info(f"清理后标题: {title}")
+                if not response.choices[0]:
+                    self.logger.warning(f"⚠️ API响应无效：choices[0]为空")
+                    last_error = "choices[0]为空"
+                    continue
 
-            # 检查标题是否包含不完整的词语模式
-            # 检测常见的不完整模式，如三个字的缩写、不完整的词语等
-            incomplete_patterns = [
-                r'[^EPC总承包]{3}控',  # 三字+控（如"维保控"）
-                r'[^EPC总承包]{2}管',  # 两字+管
-                r'[^EPC总承包]{2}理',  # 两字+理
-            ]
+                message = response.choices[0].message
+                if not message:
+                    self.logger.warning(f"⚠️ API响应无效：message为空")
+                    last_error = "message为空"
+                    continue
 
-            has_incomplete_pattern = False
-            for pattern in incomplete_patterns:
-                if re.search(pattern, title):
-                    # 进一步检查是否是完整的词语
-                    # 移除"EPC总承包"后检查剩余部分
-                    remaining = title.replace('EPC总承包', '').replace('EPC', '')
-                    # 如果剩余部分很短且包含不完整模式，则认为是不完整标题
-                    if len(remaining) <= 5 and re.search(pattern, remaining):
-                        has_incomplete_pattern = True
-                        break
+                # 【v3.6.10关键修复】获取内容 - 优先使用content
+                raw_content = getattr(message, 'content', None)
 
-            if has_incomplete_pattern:
-                self.logger.warning(f"检测到标题包含不完整的词语模式: '{title}'，使用备用模板")
-                title = random.choice(title_templates)
-
-            # 检查标题长度是否在合理范围内（28-30字，尽量靠近30字）
-            if len(title) < 28:
-                self.logger.warning(f"生成的标题过短（{len(title)}字），少于28字要求")
-                # 不使用备用模板，让AI生成的标题保持原样
-
-            # 检查标题质量
-            if not title or len(title) < 5:
-                self.logger.warning(f"AI生成的标题太短或为空: '{title}'，使用备用模板")
-                title = random.choice(title_templates)
-
-            # 标题不强制包含"EPC总承包"，保持AI生成的原样
-
-            # 【智能处理超长标题】如果标题超过30字，让AI重新生成而不是硬截断
-            if len(title) > 30:
-                self.logger.warning(f"生成的标题超长（{len(title)}字），要求AI重新生成更短但完整的标题")
-
-                # 重试生成更短的标题（最多2次）
-                for retry in range(2):
-                    retry_response = self.client.chat.completions.create(
-                        model=self.config.zhipu_model_title,
-                        messages=[
-                            {
-                                "role": "system",
-                                "content": self.config.prompt_title_system
-                            },
-                            {
-                                "role": "user",
-                                "content": f"""【重要修正】之前生成的标题"{title}"超过了30字限制。
-
-请重新生成一个更短但表达完整意思的标题。
-
-【热点问题】{question}
-
-【严格要求】
-1. 字数必须在26-30字之间，不能超过30字
-2. 必须表达完整的观点，语义完整，不能有半截话
-3. 必须紧扣热点问题中的具体场景，不能写通用标题
-4. 保留数字和关键信息
-5. 建议使用感叹号增强情感冲击力
-6. 禁止使用"建议收藏"、"建议必看"等通用套话结尾
-7. 直接输出标题，不要任何解释"""
-                            }
-                        ],
-                        temperature=0.7,
-                        max_tokens=50,
-                        timeout=Constants.API_CALL_TIMEOUT  # 【v3.6.4修复】添加API调用超时
-                    )
-
-                    retry_title = retry_response.choices[0].message.content.strip()
-                    # 清理重试标题
-                    retry_title = re.sub(r'^[\d\.\、\s]+', '', retry_title)
-                    for prefix in ['标题：', '【最佳】', '最佳：', '推荐：', '爆款：', '答案：']:
-                        if retry_title.startswith(prefix):
-                            retry_title = retry_title[len(prefix):].strip()
-                    for char in '"''《》【】#*「」『』\n\r\t':
-                        retry_title = retry_title.replace(char, '')
-                    retry_title = re.sub(r'[，。、：:,]$', '', retry_title).strip()  # 保留感叹号
-
-                    self.logger.info(f"重试第{retry+1}次生成标题: {retry_title} (长度: {len(retry_title)}字)")
-
-                    if 26 <= len(retry_title) <= 30:
-                        title = retry_title
-                        self.logger.info(f"✓ 重试成功，使用新标题: {title}")
-                        break
-                    elif len(retry_title) < 26:
-                        # 稍短也可以接受，只要意思完整
-                        title = retry_title
-                        self.logger.info(f"✓ 使用较短但完整的标题: {title}")
-                        break
-                else:
-                    # 重试2次后仍不理想，使用备用模板
-                    self.logger.warning(f"重试2次后标题仍不符合要求，使用备用模板")
-                    title = random.choice(title_templates)
-
-            # 标题与问题相关性验证（确保标题准确反映问题内容）
-            if not self._validate_title_relevance(title, question):
-                self.logger.warning(f"标题与问题相关性不足，使用备用模板")
-                title = random.choice(title_templates)
-
-            # 【关键词验证】确保标题包含搜索关键词
-            if keyword and keyword not in title:
-                self.logger.warning(f"标题不包含搜索关键词「{keyword}」，尝试添加")
-                # 尝试在标题中添加关键词（智能添加，避免重复）
-                # 计算添加关键词后的长度
-                new_title_with_keyword = f"{keyword}{title}"
-                if len(new_title_with_keyword) <= 30:
-                    # 如果添加关键词后不超过30字，添加关键词
-                    title = new_title_with_keyword
-                    self.logger.info(f"✓ 已添加关键词「{keyword}」，新标题: {title}")
-                else:
-                    # 标题太长无法直接添加，尝试替换通用词
-                    # 如果标题包含"EPC项目"而关键词更具体，尝试替换
-                    if 'EPC项目' in title and keyword not in ['EPC', 'EPC总承包']:
-                        new_title = title.replace('EPC项目', f'{keyword}项目', 1)
-                        if len(new_title) <= 30:
-                            title = new_title
-                            self.logger.info(f"✓ 已替换通用词为关键词，新标题: {title}")
-                        else:
-                            self.logger.warning(f"⚠ 标题无法添加关键词「{keyword}」且不超30字，保持原标题")
+                # 【重要】GLM-4.7-Flash 模型可能会进行深度思考
+                # 如果content为空但有reasoning_content，说明模型在思考但未输出最终结果
+                if not raw_content or raw_content.strip() == '':
+                    reasoning_content = getattr(message, 'reasoning_content', None)
+                    if reasoning_content and reasoning_content.strip():
+                        self.logger.warning(f"⚠️ content为空但存在reasoning_content（模型思考中），需要重试")
+                        self.logger.debug(f"reasoning_content长度: {len(reasoning_content)}")
+                        # 不使用reasoning_content，而是重试
+                        last_error = "模型只输出了思考过程，需要重试"
+                        continue
                     else:
-                        self.logger.warning(f"⚠ 标题无法添加关键词「{keyword}」且不超30字，保持原标题")
+                        self.logger.warning(f"⚠️ API响应无效：content为空且无reasoning_content")
+                        last_error = "content为None"
+                        continue
 
-            self.logger.info(f"✓ 最终标题: {title} (长度: {len(title)}字)")
-            return title
+                # 清理标题
+                title = _clean_title(raw_content)
+                self.logger.info(f"AI原始输出: {raw_content.strip()}")
+                self.logger.info(f"清理后标题: {title}")
 
-        except Exception as e:
-            self.logger.error(f"生成10万+爆款标题失败: {str(e)}")
-            # 返回后备标题（28-30字，高质量爆款风格）
-            fallback_titles = [
-                "EPC总承包设计变更索赔90%人都做错这3点很关键",
-                "掌握这5个技巧让EPC项目利润提升30%不是梦",
-                "别让设计变更毁了你的EPC项目4招教你规避风险",
-                "EPC合同这5个条款不看清后果很严重建议收藏",
-                "从业10年揭秘EPC总承包5个隐藏利润点必看",
-                "EPC项目投标报价变更3大风险点合同谈判必知",
-            ]
-            self.logger.info(f"使用备用标题: {random.choice(fallback_titles)}")
-            return random.choice(fallback_titles)
+                # 【v3.6.10新增】严格的标题验证
+                if not title:
+                    self.logger.warning(f"⚠️ 清理后标题为空，重试中...")
+                    last_error = "清理后标题为空"
+                    continue
+
+                if len(title) < 10:
+                    self.logger.warning(f"⚠️ 标题过短（{len(title)}字），重试中...")
+                    last_error = f"标题过短: {len(title)}字"
+                    title = ""
+                    continue
+
+                # 标题有效，跳出重试循环
+                self.logger.info(f"✅ 标题生成成功 (尝试 {retry + 1}/{MAX_TITLE_RETRIES})")
+                break
+
+            except Exception as api_error:
+                last_error = str(api_error)
+                self.logger.error(f"❌ 标题生成API调用失败 (尝试 {retry + 1}/{MAX_TITLE_RETRIES}): {str(api_error)}")
+                if retry < MAX_TITLE_RETRIES - 1:
+                    wait_time = 2 + retry  # 递增等待时间
+                    self.logger.info(f"⏳ 等待 {wait_time} 秒后重试...")
+                    time.sleep(wait_time)
+                continue
+
+        # 【v3.6.10新增】如果所有重试都失败，使用备用模板
+        if not title:
+            self.logger.warning(f"⚠️ 所有重试均失败 (最后错误: {last_error})，使用备用标题模板")
+            title = random.choice(title_templates)
+            self.logger.info(f"📋 使用备用标题: {title}")
+
+        # === 标题后处理（统一处理逻辑）===
+
+        # 检查标题长度
+        if len(title) < 28:
+            self.logger.warning(f"生成的标题过短（{len(title)}字），少于28字要求")
+
+        # 智能处理超长标题
+        if len(title) > 30:
+            self.logger.warning(f"生成的标题超长（{len(title)}字），进行智能截断")
+            # 尝试在标点符号处截断
+            truncate_points = ['！', '？', '。', '，', '：']
+            for point in truncate_points:
+                pos = title.rfind(point, 0, 30)
+                if pos > 20:  # 确保截断后还有足够内容
+                    title = title[:pos + 1]
+                    self.logger.info(f"✓ 在标点处截断: {title}")
+                    break
+            else:
+                # 没有合适的截断点，直接截断到30字
+                title = title[:30]
+                self.logger.info(f"✓ 直接截断到30字: {title}")
+
+        # 关键词验证
+        if keyword and keyword not in title:
+            self.logger.warning(f"标题不包含搜索关键词「{keyword}」，尝试添加")
+            new_title = f"{keyword}{title}"
+            if len(new_title) <= 30:
+                title = new_title
+                self.logger.info(f"✓ 已添加关键词「{keyword}」，新标题: {title}")
+            elif 'EPC项目' in title and keyword not in ['EPC', 'EPC总承包']:
+                new_title = title.replace('EPC项目', f'{keyword}项目', 1)
+                if len(new_title) <= 30:
+                    title = new_title
+                    self.logger.info(f"✓ 已替换为关键词，新标题: {title}")
+
+        self.logger.info(f"✓ 最终标题: {title} (长度: {len(title)}字)")
+        return title
 
     # 图片模板库 - 根据关键词匹配预设模板，减少AI图片生成调用（成本优化）
     IMAGE_TEMPLATES = {

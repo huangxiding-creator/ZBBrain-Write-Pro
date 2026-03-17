@@ -12,6 +12,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions CI/CD workflow
 - Issue and Pull Request templates
 
+## [3.6.10] - 2026-03-17
+
+### Fixed - 标题生成 AI 返回空问题彻底修复
+**重试机制 + 模型优化 + 响应验证**
+
+1. 🐛 **AI 返回空标题问题** - Critical fix
+   - **问题**: GLM-4.7-Flash 模型在某些情况下只返回思考过程（reasoning_content），而 content 为空
+   - **症状**: 日志显示 `AI原始输出: ` (空)，导致使用备用标题模板
+   - **根本原因**: GLM-4.7-Flash 是深度思考模型，会将完整思考过程放在 reasoning_content 中
+   - **修复**: 将模型从 `glm-4.7-flash` 改为 `glm-4-flash`（标准输出模型）
+
+2. 🔧 **标题生成增强** - Reliability improvement
+   - 增加 `max_tokens` 从 100 到 300，确保模型有足够空间输出结果
+   - 添加 5 次重试机制，处理偶发性空响应
+   - 增强响应验证：检查 response、choices、message、content 有效性
+   - 如果 content 为空但存在 reasoning_content，判定为思考模式，触发重试
+   - 添加详细日志便于调试
+
+3. 🔧 **模型配置更新** - config.ini
+   - `低成本模型名称`: glm-4.7-flash → glm-4-flash
+   - `高质量模型名称`: glm-4.7-flash → glm-4-flash
+   - 两个模型都使用 glm-4-flash，保证稳定性和免费使用
+
+4. ✅ **测试验证** - Test passed
+   - 创建 test_title_generation.py 测试脚本
+   - 测试用例 1: "EPC总承包全过程咨询：如何应对2026年人才大战" ✓
+   - 测试用例 2: "EPC项目设计变更控制：4大策略助你锁定利润" ✓
+   - 通过率: 100%
+
+### Technical Details
+- `generate_catchy_title()` 方法重构，添加重试循环
+- 响应验证：response → choices → message → content 逐级检查
+- 思考模式检测：content 为空 + reasoning_content 存在 → 重试
+- 温度递减：每次重试降低 temperature 0.1，提高稳定性
+
 ## [3.6.9] - 2026-03-17
 
 ### Fixed - 登录持久化彻底修复（Super-Skill V3.10 深度分析）
