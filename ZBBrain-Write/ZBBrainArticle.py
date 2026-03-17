@@ -2889,13 +2889,12 @@ class Config:
         self.zhipu_api_url = sanitize_url(self.config.get('智谱AI', 'API 地址'))
         # 【0成本优化 V2.0】使用 GLM-4.7-Flash 完全免费模型
         # GLM-4.7-Flash: 200K上下文，同级别最强通用能力，完全免费
-        # 低成本模型配置（用于简单任务，如生成问题、标题、图片提示词）- 免费
-        self.zhipu_model_fast = self.config.get('智谱AI', '低成本模型名称', fallback='glm-4.7-flash')
-        # 标题生成也使用低成本模型，通过优化提示词提升质量
-        self.zhipu_model_title = self.zhipu_model_fast
-        # 【0成本优化 V2.0】高质量模型也使用 GLM-4.7-Flash 免费，通过增强提示词保障质量
-        # GLM-4.7-Flash 能力足以胜任内容结构化和HTML排版任务
-        self.zhipu_model_pro = self.config.get('智谱AI', '高质量模型名称', fallback='glm-4.7-flash')
+        # 低成本模型配置（用于简单任务，如生成问题、图片提示词）- 免费
+        self.zhipu_model_fast = self.config.get('智谱AI', '低成本模型名称', fallback='glm-4-flash')
+        # 【v3.6.11优化】标题生成使用专用模型，优先使用标准输出模型避免深度思考模型的空输出问题
+        self.zhipu_model_title = self.config.get('智谱AI', '标题生成模型', fallback='glm-4-flash')
+        # 【0成本优化 V2.0】高质量模型也使用免费模型，通过增强提示词保障质量
+        self.zhipu_model_pro = self.config.get('智谱AI', '高质量模型名称', fallback='glm-4-flash')
         # 图片生成模型配置（cogview-3-flash 免费，cogview-3 收费）
         self.image_model = self.config.get('智谱AI', '图片生成模型', fallback='cogview-3-flash')
         # 兼容旧配置（如果没有指定低/高质量模型，则使用统一的模型名称）
@@ -5501,9 +5500,67 @@ class ZhipuAIAnalyzer:
             # 移除引号和特殊符号
             for char in '"''《》【】#*「」『』\n\r\t':
                 cleaned = cleaned.replace(char, '')
-            # 移除结尾标点（保留感叹号）
+            # 移除结尾标点（保留感叹号和问号）
             cleaned = re.sub(r'[，。、：:,]$', '', cleaned)
             return cleaned.strip()
+
+        def _is_complete_sentence(title: str) -> bool:
+            """【v3.6.11新增】检测标题是否是完整句子"""
+            if not title:
+                return False
+            # 检查是否有结尾标点（感叹号、问号、句号）
+            if title[-1] in '！？。!?':
+                return True
+            # 检查是否有谓语动词（简单判断：包含"是"、"有"、"能"、"会"等）
+            verbs = ['是', '有', '能', '会', '要', '可以', '需要', '必须', '应该', '让', '使', '帮']
+            for v in verbs:
+                if v in title:
+                    return True
+            return False
+
+        def _smart_truncate_title(title: str, max_len: int = 30) -> str:
+            """【v3.6.11新增】智能截断标题到完整句子
+
+            优先级：
+            1. 在标点符号处截断
+            2. 在连接词处截断
+            3. 保持语义完整性
+            """
+            if len(title) <= max_len:
+                return title
+
+            # 如果标题以感叹号或问号结尾，且前30个字符内有标点，尝试在标点处截断
+            if title[-1] in '！？!?':
+                # 在max_len范围内找最后一个标点
+                search_area = title[:max_len]
+                punct_positions = []
+                for i, char in enumerate(search_area):
+                    if char in '！？，。、：,!?.:':
+                        punct_positions.append(i)
+
+                if punct_positions:
+                    # 在最后一个标点处截断
+                    cut_pos = punct_positions[-1] + 1
+                    truncated = title[:cut_pos]
+                    return truncated
+
+            # 尝试在连接词处断开
+            connectors = ['，而且', '，并且', '，同时', '，另外', '，此外', '，但是', '，但']
+            for conn in connectors:
+                if conn in title[:max_len + len(conn)]:
+                    cut_pos = title.find(conn)
+                    if 20 <= cut_pos <= max_len:  # 确保截断后不会太短
+                        return title[:cut_pos] + '！'
+
+            # 尝试在逗号处截断并添加感叹号
+            if '，' in title[:max_len]:
+                last_comma = title[:max_len].rfind('，')
+                if last_comma >= 20:  # 确保截断后不会太短
+                    return title[:last_comma] + '！'
+
+            # 最后手段：直接截断并添加感叹号（但记录警告）
+            self.logger.warning(f"无法智能截断，将硬截断并添加感叹号: {title}")
+            return title[:max_len - 1] + '！'
 
         # 构建关键词要求
         keyword_requirement = ""
@@ -5525,6 +5582,24 @@ class ZhipuAIAnalyzer:
                 current_temp = 0.9 - (retry * 0.1)  # 逐次降低温度，获得更稳定输出
                 current_temp = max(0.5, current_temp)
 
+                # 【v3.6.11新增】根据上次失败原因动态调整提示词
+                retry_hint = ""
+                if last_error and retry > 0:
+                    if "超长" in str(last_error):
+                        retry_hint = "\n\n【紧急提醒】上次生成的标题太长了！这次必须严格控制在28-30字以内，超过30字直接拒绝！"
+                    elif "过短" in str(last_error):
+                        retry_hint = "\n\n【紧急提醒】上次生成的标题太短了！这次必须生成28-30字的完整标题。"
+                    elif "空" in str(last_error) or "None" in str(last_error):
+                        retry_hint = "\n\n【紧急提醒】上次没有正确输出！这次必须直接输出一个完整的标题，不要任何解释。"
+                    else:
+                        retry_hint = "\n\n【紧急提醒】上次生成失败，这次请务必严格按照要求生成28-30字的完整标题。"
+
+                enhanced_user_prompt = self.config.prompt_title_user.format(
+                    question=question,
+                    content=content_for_analysis,
+                    keyword_requirement=keyword_requirement
+                ) + retry_hint
+
                 response = self.client.chat.completions.create(
                     model=self.config.zhipu_model_title,
                     messages=[
@@ -5534,11 +5609,7 @@ class ZhipuAIAnalyzer:
                         },
                         {
                             "role": "user",
-                            "content": self.config.prompt_title_user.format(
-                                question=question,
-                                content=content_for_analysis,
-                                keyword_requirement=keyword_requirement
-                            )
+                            "content": enhanced_user_prompt
                         }
                     ],
                     temperature=current_temp,
@@ -5603,12 +5674,35 @@ class ZhipuAIAnalyzer:
                     title = ""
                     continue
 
-                # 【v3.6.10新增】超长标题检测 - 要求完整句子，不能硬截断
-                if len(title) > 30:
-                    self.logger.warning(f"⚠️ 标题超长（{len(title)}字），必须是完整句子，触发重试")
-                    last_error = f"标题超长: {len(title)}字，需要重新生成"
-                    title = ""
-                    continue
+                # 【v3.6.11优化】超长标题智能处理 - 优先智能截断，而非硬重试
+                if len(title) > 32:  # 放宽限制到32字
+                    # 检查是否是完整句子
+                    if _is_complete_sentence(title):
+                        # 是完整句子，尝试智能截断
+                        truncated = _smart_truncate_title(title, 30)
+                        if len(truncated) <= 30 and _is_complete_sentence(truncated):
+                            self.logger.info(f"✅ 智能截断成功: {title} → {truncated}")
+                            title = truncated
+                        else:
+                            self.logger.warning(f"⚠️ 智能截断失败，触发重试")
+                            last_error = f"标题超长({len(title)}字)，无法智能截断"
+                            title = ""
+                            continue
+                    else:
+                        # 不是完整句子，必须重试
+                        self.logger.warning(f"⚠️ 标题超长（{len(title)}字）且不是完整句子，触发重试")
+                        last_error = f"标题超长: {len(title)}字，非完整句子"
+                        title = ""
+                        continue
+                elif len(title) > 30:
+                    # 31-32字的标题，如果是完整句子则接受
+                    if not _is_complete_sentence(title):
+                        self.logger.warning(f"⚠️ 标题稍长（{len(title)}字）且不是完整句子，触发重试")
+                        last_error = f"标题稍长: {len(title)}字，非完整句子"
+                        title = ""
+                        continue
+                    else:
+                        self.logger.info(f"✅ 标题稍长（{len(title)}字）但是完整句子，接受")
 
                 # 标题有效，跳出重试循环
                 self.logger.info(f"✅ 标题生成成功 (尝试 {retry + 1}/{MAX_TITLE_RETRIES})")
@@ -11525,7 +11619,7 @@ def main():
 
     # 输出配置信息
     logger.info("=" * 60)
-    logger.info("ZBBrain-Write v3.6.9 (Cookie Domain Isolation)")
+    logger.info("ZBBrain-Write v3.6.11 (Title Generation Optimization)")
     logger.info("=" * 60)
 
     # 【0成本优化 V2.0】显示模型配置和成本优化状态
