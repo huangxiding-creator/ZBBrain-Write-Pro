@@ -5603,6 +5603,13 @@ class ZhipuAIAnalyzer:
                     title = ""
                     continue
 
+                # 【v3.6.10新增】超长标题检测 - 要求完整句子，不能硬截断
+                if len(title) > 30:
+                    self.logger.warning(f"⚠️ 标题超长（{len(title)}字），必须是完整句子，触发重试")
+                    last_error = f"标题超长: {len(title)}字，需要重新生成"
+                    title = ""
+                    continue
+
                 # 标题有效，跳出重试循环
                 self.logger.info(f"✅ 标题生成成功 (尝试 {retry + 1}/{MAX_TITLE_RETRIES})")
                 break
@@ -5624,25 +5631,12 @@ class ZhipuAIAnalyzer:
 
         # === 标题后处理（统一处理逻辑）===
 
-        # 检查标题长度
-        if len(title) < 28:
-            self.logger.warning(f"生成的标题过短（{len(title)}字），少于28字要求")
+        # 检查标题长度（只记录警告，不截断）
+        if len(title) < 26:
+            self.logger.warning(f"生成的标题略短（{len(title)}字），建议26-30字")
 
-        # 智能处理超长标题
-        if len(title) > 30:
-            self.logger.warning(f"生成的标题超长（{len(title)}字），进行智能截断")
-            # 尝试在标点符号处截断
-            truncate_points = ['！', '？', '。', '，', '：']
-            for point in truncate_points:
-                pos = title.rfind(point, 0, 30)
-                if pos > 20:  # 确保截断后还有足够内容
-                    title = title[:pos + 1]
-                    self.logger.info(f"✓ 在标点处截断: {title}")
-                    break
-            else:
-                # 没有合适的截断点，直接截断到30字
-                title = title[:30]
-                self.logger.info(f"✓ 直接截断到30字: {title}")
+        # 【v3.6.10】移除硬截断逻辑 - 标题必须是完整句子
+        # 如果标题超长，说明上面重试失败后使用了备用模板，备用模板都是合适长度的
 
         # 关键词验证
         if keyword and keyword not in title:
