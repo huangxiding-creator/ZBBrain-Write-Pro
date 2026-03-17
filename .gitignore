@@ -25,6 +25,8 @@ ZBBrain-Write/service_registry.json
 # 浏览器数据
 ZBBrain-Write/browser_data/
 browser_data/
+ZBBrain-Write/browser_data_backup_*/
+browser_data_backup_*/
 
 # 缓存
 ZBBrain-Write/.cache/

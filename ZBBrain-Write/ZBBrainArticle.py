@@ -102,6 +102,10 @@ import html
 import signal
 import random
 import sqlite3
+import tempfile
+import threading
+import platform
+# fcntl 仅在 Unix/Linux 上可用，Windows 使用 msvcrt
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -139,6 +143,8 @@ class Constants:
 
     # 网络请求相关
     DEFAULT_REQUEST_TIMEOUT = 30
+    API_CALL_TIMEOUT = 120  # AI API调用默认超时（秒）
+    API_STREAM_TIMEOUT = 300  # AI流式响应超时（秒）
     MAX_RETRY_ATTEMPTS = 3
     RETRY_BACKOFF_BASE = 2
 
@@ -175,6 +181,415 @@ class Constants:
     ERROR_INPUT_NOT_FOUND = "无法找到或填充输入框"
     ERROR_NO_ANSWER = "等待超时且未获取到任何回答"
     ERROR_LOGIN_TIMEOUT = "等待登录超时"
+
+    # 【v3.6.8】质量评分阈值
+    MIN_QUESTION_SCORE = 60  # 热点问题最低分数
+    MIN_ANSWER_SCORE = 50    # 回答最低分数
+    MIN_TITLE_SCORE = 70     # 标题最低分数
+
+
+# =============================================================================
+# 【v3.6.7新增】内容质量评分器
+# =============================================================================
+
+class ContentQualityScorer:
+    """
+    内容质量评分器
+
+    用于评估AI生成内容的质量，确保输出符合标准。
+    评分维度：
+    - 热点问题：长度、场景词、问句格式
+    - 回答内容：长度、结构、专业性
+    - 标题：长度、关键词、吸引力
+
+    v3.6.7新增
+    """
+
+    # 场景关键词（EPC总承包相关）
+    SCENE_WORDS = [
+        'EPC', '总承包', '投标', '设计', '施工', '竣工', '结算',
+        '合同', '分包', '索赔', '变更', '成本', '质量', '安全',
+        '风险', '管理', '进度', '采购', '监理', '审计'
+    ]
+
+    # 专业性关键词
+    PROFESSIONAL_WORDS = [
+        '合同', '风险', '管理', '控制', '流程', '规范', '标准',
+        '条款', '责任', '义务', '权利', '变更', '索赔', '违约'
+    ]
+
+    # 标题吸引力词
+    ATTRACTIVE_WORDS = [
+        '必看', '必知', '实战', '技巧', '方法', '策略', '避坑',
+        '注意', '建议', '解析', '指南', '关键', '核心', '重要'
+    ]
+
+    def __init__(self, logger=None):
+        """初始化评分器"""
+        self.logger = logger
+
+    def _log(self, level: str, message: str):
+        """安全的日志记录"""
+        if self.logger:
+            getattr(self.logger, level)(message)
+
+    def score_question(self, question: str) -> dict:
+        """
+        评估热点问题质量
+
+        Args:
+            question: 待评估的问题文本
+
+        Returns:
+            dict: 包含score（分数）、issues（问题列表）、passed（是否通过）
+        """
+        if not question:
+            return {'score': 0, 'issues': ['问题为空'], 'passed': False}
+
+        score = 0
+        issues = []
+        max_score = 100
+
+        # 1. 长度检查 (40分)
+        if len(question) >= 50:
+            score += 40
+        elif len(question) >= 30:
+            score += 25
+            issues.append(f"问题长度({len(question)}字)不足50字")
+        else:
+            score += 10
+            issues.append(f"问题长度({len(question)}字)严重不足")
+
+        # 2. 场景词检查 (30分)
+        scene_count = sum(1 for w in self.SCENE_WORDS if w in question)
+        if scene_count >= 2:
+            score += 30
+        elif scene_count == 1:
+            score += 15
+        else:
+            issues.append("缺少场景关键词")
+
+        # 3. 问句格式检查 (30分)
+        # 问号结尾 (15分)
+        if question.endswith('？') or question.endswith('?'):
+            score += 15
+        else:
+            issues.append("问题应以问号结尾")
+
+        # 疑问词 (15分)
+        question_words = ['如何', '怎样', '为什么', '什么', '哪些', '怎么', '能否', '是否']
+        if any(w in question for w in question_words):
+            score += 15
+        else:
+            issues.append("缺少疑问词（如何/怎样/为什么等）")
+
+        passed = score >= Constants.MIN_QUESTION_SCORE
+
+        if not passed:
+            self._log('warning', f"热点问题质量不达标: {score}分 - {issues}")
+        else:
+            self._log('info', f"✓ 热点问题质量达标: {score}分")
+
+        return {
+            'score': score,
+            'max_score': max_score,
+            'issues': issues,
+            'passed': passed,
+            'details': {
+                'length': len(question),
+                'scene_words_count': scene_count,
+                'has_question_mark': question.endswith('？') or question.endswith('?')
+            }
+        }
+
+    def score_answer(self, answer: str) -> dict:
+        """
+        评估回答内容质量
+
+        Args:
+            answer: 待评估的回答文本
+
+        Returns:
+            dict: 包含score（分数）、issues（问题列表）、passed（是否通过）
+        """
+        if not answer:
+            return {'score': 0, 'issues': ['回答为空'], 'passed': False}
+
+        score = 0
+        issues = []
+        max_score = 100
+
+        # 1. 长度检查 (50分)
+        if len(answer) >= 1000:
+            score += 50
+        elif len(answer) >= 500:
+            score += 35
+            issues.append(f"回答长度({len(answer)}字)建议达到1000字以上")
+        elif len(answer) >= 300:
+            score += 20
+            issues.append(f"回答长度({len(answer)}字)不足")
+        else:
+            score += 5
+            issues.append(f"回答长度({len(answer)}字)严重不足")
+
+        # 2. 结构检查 (30分)
+        # 检查是否有分点/分段 (15分)
+        if '一、' in answer or '1.' in answer or '第一' in answer or '首先' in answer:
+            score += 15
+        else:
+            issues.append("缺乏分点结构")
+
+        # 检查是否有建议/方法 (15分)
+        if any(w in answer for w in ['建议', '方法', '措施', '对策', '策略']):
+            score += 15
+        else:
+            issues.append("缺乏具体建议")
+
+        # 3. 专业性检查 (20分)
+        prof_count = sum(1 for w in self.PROFESSIONAL_WORDS if w in answer)
+        if prof_count >= 3:
+            score += 20
+        elif prof_count >= 1:
+            score += 10
+        else:
+            issues.append("专业性词汇不足")
+
+        passed = score >= Constants.MIN_ANSWER_SCORE
+
+        if not passed:
+            self._log('warning', f"回答质量不达标: {score}分 - {issues}")
+        else:
+            self._log('info', f"✓ 回答质量达标: {score}分")
+
+        return {
+            'score': score,
+            'max_score': max_score,
+            'issues': issues,
+            'passed': passed,
+            'details': {
+                'length': len(answer),
+                'has_structure': '一、' in answer or '1.' in answer,
+                'professional_words_count': prof_count
+            }
+        }
+
+    def score_title(self, title: str, keyword: str = None) -> dict:
+        """
+        评估标题质量
+
+        Args:
+            title: 待评估的标题文本
+            keyword: 可选的关键词，检查是否包含
+
+        Returns:
+            dict: 包含score（分数）、issues（问题列表）、passed（是否通过）
+        """
+        if not title:
+            return {'score': 0, 'issues': ['标题为空'], 'passed': False}
+
+        score = 0
+        issues = []
+        max_score = 100
+
+        # 1. 长度检查 (30分)
+        if 28 <= len(title) <= 30:
+            score += 30
+        elif 25 <= len(title) <= 32:
+            score += 25
+        elif 20 <= len(title) <= 35:
+            score += 15
+            issues.append(f"标题长度({len(title)}字)建议在28-30字之间")
+        else:
+            score += 5
+            issues.append(f"标题长度({len(title)}字)不符合要求(28-30字)")
+
+        # 2. 关键词检查 (40分)
+        # 必须包含EPC或总承包 (20分)
+        if 'EPC' in title or '总承包' in title:
+            score += 20
+        else:
+            issues.append("标题缺少'EPC'或'总承包'")
+
+        # 包含搜索关键词 (20分)
+        if keyword and keyword in title:
+            score += 20
+        elif keyword:
+            issues.append(f"标题缺少关键词'{keyword}'")
+
+        # 3. 吸引力检查 (30分)
+        # 包含数字 (15分)
+        if any(c.isdigit() for c in title):
+            score += 15
+        else:
+            issues.append("标题建议包含数字")
+
+        # 包含吸引力词汇 (15分)
+        if any(w in title for w in self.ATTRACTIVE_WORDS):
+            score += 15
+        elif '！' in title or '!' in title:
+            score += 10
+        else:
+            issues.append("标题建议包含吸引力词汇或感叹号")
+
+        passed = score >= Constants.MIN_TITLE_SCORE
+
+        if not passed:
+            self._log('warning', f"标题质量不达标: {score}分 - {issues}")
+        else:
+            self._log('info', f"✓ 标题质量达标: {score}分")
+
+        return {
+            'score': score,
+            'max_score': max_score,
+            'issues': issues,
+            'passed': passed,
+            'details': {
+                'length': len(title),
+                'has_epc': 'EPC' in title or '总承包' in title,
+                'has_keyword': keyword in title if keyword else None,
+                'has_number': any(c.isdigit() for c in title)
+            }
+        }
+
+
+# =============================================================================
+# v3.6.4 原子写入和文件锁工具
+# =============================================================================
+
+import json as json_module
+
+def atomic_write_json(filepath: str, data: Any, logger: Optional[Any] = None) -> bool:
+    """原子写入JSON文件，防止写入过程中崩溃导致文件损坏
+
+    Args:
+        filepath: 目标文件路径
+        data: 要写入的数据
+        logger: 可选的日志记录器
+
+    Returns:
+        bool: 写入是否成功
+    """
+    filepath = Path(filepath)
+    temp_fd = None
+    temp_path = None
+
+    try:
+        # 创建临时文件
+        temp_fd, temp_path = tempfile.mkstemp(
+            dir=str(filepath.parent),
+            prefix='.tmp_',
+            suffix='.json'
+        )
+
+        # 写入临时文件
+        with os.fdopen(temp_fd, 'w', encoding='utf-8') as f:
+            json_module.dump(data, f, ensure_ascii=False, indent=2)
+
+        # 原子替换（在 Unix 和 Windows 上都有效）
+        os.replace(temp_path, str(filepath))
+
+        return True
+
+    except Exception as e:
+        if logger:
+            logger.error(f"原子写入JSON失败: {filepath}, 错误: {str(e)}")
+
+        # 清理临时文件
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.unlink(temp_path)
+            except Exception:
+                pass
+
+        return False
+
+
+@contextmanager
+def file_lock(filepath: str, timeout: float = 10.0, logger: Optional[Any] = None):
+    """跨平台文件锁上下文管理器
+
+    Args:
+        filepath: 要锁定的文件路径
+        timeout: 获取锁的超时时间（秒）
+        logger: 可选的日志记录器
+
+    Yields:
+        bool: 是否成功获取锁
+    """
+    lock_path = str(filepath) + '.lock'
+    lock_file = None
+    acquired = False
+
+    try:
+        # 创建锁文件
+        lock_file = open(lock_path, 'w')
+
+        # 根据平台选择锁定方式
+        if platform.system() != 'Windows':
+            # Unix/Linux: 使用 fcntl
+            import fcntl
+            start_time = time.time()
+
+            while True:
+                try:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    acquired = True
+                    break
+                except (IOError, BlockingIOError):
+                    if time.time() - start_time >= timeout:
+                        if logger:
+                            logger.warning(f"获取文件锁超时: {filepath}")
+                        break
+                    time.sleep(0.1)
+        else:
+            # Windows: 使用 msvcrt (简化版，非阻塞)
+            try:
+                import msvcrt
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                acquired = True
+            except (IOError, OSError):
+                if logger:
+                    logger.warning(f"Windows上获取文件锁失败: {filepath}")
+
+        yield acquired
+
+    finally:
+        # 释放锁
+        if lock_file:
+            try:
+                if platform.system() != 'Windows':
+                    import fcntl
+                    if acquired:
+                        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                else:
+                    try:
+                        import msvcrt
+                        if acquired:
+                            msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+                    except (IOError, OSError):
+                        pass
+            except Exception:
+                pass
+
+            lock_file.close()
+
+            # 删除锁文件
+            try:
+                os.unlink(lock_path)
+            except Exception:
+                pass
+
+
+# 全局线程锁用于单例模式
+_singleton_locks: Dict[str, threading.Lock] = {}
+_singleton_lock = threading.Lock()
+
+def get_singleton_lock(name: str) -> threading.Lock:
+    """获取单例模式的线程锁"""
+    with _singleton_lock:
+        if name not in _singleton_locks:
+            _singleton_locks[name] = threading.Lock()
+        return _singleton_locks[name]
 
 
 # =============================================================================
@@ -3116,6 +3531,13 @@ class Config:
             self._init_wechat_accounts()
 
         if self.wechat_accounts:
+            # 【v3.6.4修复】添加索引边界检查，防止数组越界
+            safe_index = max(0, min(self.current_account_index, len(self.wechat_accounts) - 1))
+            if safe_index != self.current_account_index:
+                if hasattr(self, 'logger') and self.logger:
+                    self.logger.warning(f"公众号索引 {self.current_account_index} 超出范围，已修正为 {safe_index}")
+                self.current_account_index = safe_index
+
             account = self.wechat_accounts[self.current_account_index]
             return {
                 'name': account.get('name', '未命名'),
@@ -3172,10 +3594,19 @@ class Config:
         self.wechat_secret = account.get('appsecret', '')
         self.default_author = account.get('default_author', '总包大脑')
 
+        # 【v3.6.4修复】同步current_account_index，确保轮换逻辑正确
+        # 根据appid找到对应的索引
+        if self.wechat_accounts:
+            for i, acc in enumerate(self.wechat_accounts):
+                if acc.get('appid') == self.wechat_appid:
+                    self.current_account_index = i
+                    break
+
         if hasattr(self, 'logger') and self.logger:
             self.logger.info(f"✓ 切换到公众号: {account.get('name', '未命名')}")
             self.logger.info(f"  AppID: {self.wechat_appid[:8]}...")
             self.logger.info(f"  默认作者: {self.default_author}")
+            self.logger.info(f"  当前索引: {self.current_account_index}")
 
     def get_all_wechat_accounts(self) -> list:
         """获取所有微信公众号配置列表
@@ -3674,6 +4105,8 @@ class StagehandBrowser:
         Args:
             headless: 是否使用无头模式（不显示浏览器窗口）
             use_persistent_context: 是否使用持久化上下文（保持登录状态）
+                注意：现在使用 launch() + new_context() + cookies 存储方式
+                比 launch_persistent_context 在 Windows 上更稳定
 
         Raises:
             BrowserError: 浏览器启动失败时抛出
@@ -3682,47 +4115,177 @@ class StagehandBrowser:
 
         self.playwright = await async_playwright().start()
 
+        # 始终使用 launch() + new_context() 方式，比 launch_persistent_context 更稳定
+        self.browser = await self.playwright.chromium.launch(
+            headless=headless,
+            args=[
+                '--disable-blink-features=AutomationControlled',
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--start-maximized=false',
+                '--window-size=960,720'
+            ]
+        )
+
+        self.context = await self.browser.new_context(
+            viewport={'width': 960, 'height': 720},
+            screen={'width': 960, 'height': 720},
+            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        )
+
+        self.page = await self.context.new_page()
+
+        # 如果需要保持登录状态，加载已保存的 cookies
         if use_persistent_context:
-            # 使用持久化上下文（保持登录状态）
-            self.context = await self.playwright.chromium.launch_persistent_context(
-                user_data_dir=self.config.user_data_dir,
-                headless=headless,
-                args=[
-                    '--disable-blink-features=AutomationControlled',
-                    '--no-sandbox',
-                    '--disable-setuid-sandbox',
-                    '--start-maximized=false',
-                    '--window-size=960,720'
-                ],
-                viewport={'width': 960, 'height': 720},
-                screen={'width': 960, 'height': 720},
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-            )
-
-            if len(self.context.pages) > 0:
-                self.page = self.context.pages[0]
-            else:
-                self.page = await self.context.new_page()
-        else:
-            # 使用标准模式
-            self.browser = await self.playwright.chromium.launch(
-                headless=headless,
-                args=[
-                    '--disable-blink-features=AutomationControlled',
-                    '--no-sandbox',
-                    '--disable-setuid-sandbox'
-                ]
-            )
-
-            self.context = await self.browser.new_context(
-                viewport={'width': 960, 'height': 720},
-                screen={'width': 960, 'height': 720},
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-            )
-
-            self.page = await self.context.new_page()
+            await self._load_cookies()
 
         self.logger.info("浏览器启动成功")
+
+    async def _load_cookies(self) -> bool:
+        """
+        加载保存的 cookies
+
+        【v3.6.8修复】只加载 metaso.cn 域名的 cookies
+
+        Returns:
+            bool: 是否成功加载 cookies
+        """
+        cookies_file = Path(self.config.user_data_dir) / "cookies.json"
+        if cookies_file.exists():
+            try:
+                import json
+                with open(cookies_file, 'r', encoding='utf-8') as f:
+                    cookies = json.load(f)
+
+                # 【v3.6.8新增】验证 cookies 是否来自正确的域名
+                metaso_cookies = [c for c in cookies if 'metaso' in c.get('domain', '')]
+                if not metaso_cookies:
+                    self.logger.warning("未找到 metaso.cn 域名的 cookies，文件可能已过期")
+                    return False
+
+                await self.context.add_cookies(cookies)
+                self.logger.info(f"已加载 {len(cookies)} 个 cookies (其中 {len(metaso_cookies)} 个来自 metaso.cn)")
+                return True
+            except Exception as e:
+                self.logger.warning(f"加载 cookies 失败: {e}")
+        return False
+
+    async def _save_cookies(self) -> bool:
+        """
+        保存当前 cookies
+
+        【v3.6.8关键修复】只保存 metaso.cn 域名的 cookies
+        原先保存的是 sogou.com 的 cookies，对登录持久化无效！
+
+        Returns:
+            bool: 是否成功保存 cookies
+        """
+        try:
+            import json
+            cookies_file = Path(self.config.user_data_dir) / "cookies.json"
+            cookies_file.parent.mkdir(parents=True, exist_ok=True)
+
+            # 获取所有 cookies
+            all_cookies = await self.context.cookies()
+
+            # 【v3.6.8关键修复】只保存 metaso.cn 相关的 cookies
+            metaso_cookies = [
+                c for c in all_cookies
+                if 'metaso' in c.get('domain', '')
+            ]
+
+            if not metaso_cookies:
+                self.logger.warning("⚠️ 当前没有 metaso.cn 域名的 cookies")
+                self.logger.warning("可能原因：1) 未登录 2) 在错误的页面上保存")
+                # 仍然保存所有 cookies 作为备份
+                with open(cookies_file, 'w', encoding='utf-8') as f:
+                    json.dump(all_cookies, f, ensure_ascii=False, indent=2)
+                self.logger.info(f"已保存 {len(all_cookies)} 个 cookies (无 metaso.cn cookies)")
+                return False
+
+            # 保存过滤后的 metaso.cn cookies
+            with open(cookies_file, 'w', encoding='utf-8') as f:
+                json.dump(metaso_cookies, f, ensure_ascii=False, indent=2)
+
+            self.logger.info(f"✓ 已保存 {len(metaso_cookies)} 个 metaso.cn cookies")
+            return True
+        except Exception as e:
+            self.logger.warning(f"保存 cookies 失败: {e}")
+            return False
+
+    async def _save_local_storage(self) -> bool:
+        """
+        保存当前页面的 localStorage
+
+        Returns:
+            bool: 是否成功保存 localStorage
+        """
+        try:
+            import json
+            storage_file = Path(self.config.user_data_dir) / "local_storage.json"
+            storage_file.parent.mkdir(parents=True, exist_ok=True)
+            local_storage = await self.page.evaluate("() => JSON.stringify(localStorage)")
+            with open(storage_file, 'w', encoding='utf-8') as f:
+                f.write(local_storage)
+            self.logger.info(f"已保存 localStorage")
+            return True
+        except Exception as e:
+            self.logger.warning(f"保存 localStorage 失败: {e}")
+            return False
+
+    async def _load_local_storage(self) -> bool:
+        """
+        加载 localStorage 到当前页面
+
+        Returns:
+            bool: 是否成功加载 localStorage
+        """
+        try:
+            import json
+            storage_file = Path(self.config.user_data_dir) / "local_storage.json"
+            if storage_file.exists():
+                with open(storage_file, 'r', encoding='utf-8') as f:
+                    local_storage = json.load(f)
+                await self.page.evaluate("(items) => { for (const [k, v] of Object.entries(items)) { localStorage.setItem(k, v); } }", local_storage)
+                self.logger.info(f"已加载 localStorage ({len(local_storage)} 项)")
+                return True
+        except Exception as e:
+            self.logger.warning(f"加载 localStorage 失败: {e}")
+        return False
+
+    async def _save_storage_state(self) -> bool:
+        """
+        保存完整的浏览器状态（cookies + localStorage）
+        用于持久化登录状态
+
+        Returns:
+            bool: 是否成功保存
+        """
+        try:
+            cookies_ok = await self._save_cookies()
+            storage_ok = await self._save_local_storage()
+            if cookies_ok:
+                self.logger.info("✓ 浏览器状态已保存（cookies + localStorage）")
+            return cookies_ok
+        except Exception as e:
+            self.logger.warning(f"保存浏览器状态失败: {e}")
+            return False
+
+    async def _load_storage_state(self) -> bool:
+        """
+        加载完整的浏览器状态（cookies + localStorage）
+        用于恢复登录状态
+
+        Returns:
+            bool: 是否成功加载
+        """
+        try:
+            cookies_ok = await self._load_cookies()
+            # localStorage 需要在页面加载后设置
+            return cookies_ok
+        except Exception as e:
+            self.logger.warning(f"加载浏览器状态失败: {e}")
+            return False
 
     async def goto(self, url: str, wait_until: str = "domcontentloaded", timeout: int = Constants.DEFAULT_PAGE_LOAD_TIMEOUT) -> bool:
         """
@@ -4065,22 +4628,112 @@ class StagehandBrowser:
 
         return None
 
-    async def close(self) -> None:
+    async def close(self, save_cookies: bool = True, cookie_domain_filter: str = None) -> None:
         """
         关闭浏览器
 
+        Args:
+            save_cookies: 是否在关闭前保存浏览器状态（默认 True）
+            cookie_domain_filter: 【v3.6.9新增】只保存指定域名的 cookies
+                - None: 保存所有 cookies（旧行为，不推荐）
+                - "metaso.cn": 只保存 metaso.cn 域名的 cookies（推荐）
+                - 调用时可传入 "sogou.com" 来阻止保存（因为会用空列表）
+
         清理所有浏览器资源
+
+        【v3.6.9 修复】
+        1. 添加超时保护，防止关闭卡住
+        2. 添加域名过滤，确保只保存正确的 cookies
+        3. 强制清理所有资源
         """
         self.logger.info("关闭浏览器")
+        close_timeout = 30  # 30秒超时
+
         try:
-            if self.context:
-                await self.context.close()
-            if self.browser:
-                await self.browser.close()
-            if self.playwright:
-                await self.playwright.stop()
+            # 在关闭前保存完整的浏览器状态（cookies + localStorage）
+            if save_cookies and self.context:
+                # 【v3.6.9 关键修复】只有指定了域名过滤才保存
+                if cookie_domain_filter:
+                    await self._save_storage_state_for_domain(cookie_domain_filter)
+                else:
+                    await self._save_storage_state()
+
+            # 【v3.6.9】添加超时保护
+            async def close_context():
+                if self.context:
+                    await self.context.close()
+
+            async def close_browser():
+                if self.browser:
+                    await self.browser.close()
+
+            async def stop_playwright():
+                if self.playwright:
+                    await self.playwright.stop()
+
+            # 依次关闭，每个都有超时保护
+            try:
+                await asyncio.wait_for(close_context(), timeout=close_timeout)
+            except asyncio.TimeoutError:
+                self.logger.warning(f"关闭 context 超时({close_timeout}秒)，强制继续")
+
+            try:
+                await asyncio.wait_for(close_browser(), timeout=close_timeout)
+            except asyncio.TimeoutError:
+                self.logger.warning(f"关闭 browser 超时({close_timeout}秒)，强制继续")
+
+            try:
+                await asyncio.wait_for(stop_playwright(), timeout=close_timeout)
+            except asyncio.TimeoutError:
+                self.logger.warning(f"停止 playwright 超时({close_timeout}秒)，强制继续")
+
         except Exception as e:
             self.logger.error(f"关闭浏览器失败: {str(e)}")
+        finally:
+            # 【v3.6.9】确保引用被清除
+            self.context = None
+            self.browser = None
+            self.playwright = None
+            self.page = None
+
+    async def _save_storage_state_for_domain(self, domain_filter: str) -> bool:
+        """
+        【v3.6.9 新增】只保存指定域名的浏览器状态
+
+        Args:
+            domain_filter: 域名过滤字符串（如 "metaso.cn"）
+
+        Returns:
+            bool: 是否成功保存
+        """
+        try:
+            import json
+            cookies_file = Path(self.config.user_data_dir) / "cookies.json"
+            cookies_file.parent.mkdir(parents=True, exist_ok=True)
+
+            # 获取所有 cookies
+            all_cookies = await self.context.cookies()
+
+            # 【关键修复】只保存指定域名的 cookies
+            filtered_cookies = [
+                c for c in all_cookies
+                if domain_filter in c.get('domain', '')
+            ]
+
+            if not filtered_cookies:
+                self.logger.warning(f"⚠️ 当前没有 {domain_filter} 域名的 cookies")
+                self.logger.warning("可能原因：1) 未登录 2) 在错误的页面上保存")
+                return False
+
+            # 保存过滤后的 cookies
+            with open(cookies_file, 'w', encoding='utf-8') as f:
+                json.dump(filtered_cookies, f, ensure_ascii=False, indent=2)
+
+            self.logger.info(f"✓ 已保存 {len(filtered_cookies)} 个 {domain_filter} cookies")
+            return True
+        except Exception as e:
+            self.logger.warning(f"保存 {domain_filter} cookies 失败: {e}")
+            return False
 
 
 # =============================================================================
@@ -4181,7 +4834,10 @@ class SogouWeChatScraper:
             self.logger.error(f"爬取过程出错: {str(e)}")
         finally:
             if browser:
-                await browser.close()
+                # 【v3.6.9 修复】SogouWeChatScraper 完全不保存任何 cookies
+                # 原因：它只访问 sogou.com，保存会覆盖 metaso.cn 的登录状态
+                # 使用 cookie_domain_filter="sogou.com" + save_cookies=False 双重保护
+                await browser.close(save_cookies=False, cookie_domain_filter=None)  # 不保存任何 cookies
 
         # 对提取的文章进行深度分析（关键词提取、分类、情感分析）
         if articles:
@@ -4572,6 +5228,8 @@ class ZhipuAIAnalyzer:
         Raises:
             ValueError: 如果文章列表为空或格式不正确
             AIAnalysisError: 如果AI分析失败
+
+        【v3.6.7增强】添加重试机制和质量评分
         """
         # 输入验证
         if not articles:
@@ -4603,59 +5261,74 @@ class ZhipuAIAnalyzer:
 
         self.logger.debug(f"热点问题生成 - 系统提示词长度: {len(system_prompt)}, 用户提示词长度: {len(user_prompt)}")
 
-        try:
-            response = self.client.chat.completions.create(
-                model=self.config.zhipu_model_fast,  # 使用0成本模型（glm-4.7-flash）生成问题
-                messages=[
-                    {
-                        "role": "system",
-                        "content": system_prompt
-                    },
-                    {
-                        "role": "user",
-                        "content": user_prompt
-                    }
-                ],
-                temperature=0.8,
-                max_tokens=2000
-            )
+        # 【v3.6.7新增】质量评分器
+        quality_scorer = ContentQualityScorer(self.logger)
 
-            question = response.choices[0].message.content.strip()
+        # 【v3.6.7新增】重试机制（最多3次）
+        max_retries = 3
+        question = None
 
-            # 【0成本优化V2.1】GLM-4.7-Flash 偶尔返回空响应，需要处理
-            if not question or not question.strip():
-                self.logger.warning("AI返回空响应，使用备用热点问题")
-                # 使用备用问题列表
-                backup_questions = [
-                    "在EPC总承包项目实施阶段，面对材料价格波动和工期压力的双重挑战，如何通过精细化管理实现成本控制和进度优化的平衡？",
-                    "EPC总承包项目在结算阶段常遇到哪些争议问题？如何通过合同管理和证据保全来有效维护自身权益？",
-                    "在当前市场环境下，EPC总承包企业如何通过数字化转型提升项目管理效率和风险防控能力？",
-                    "EPC项目联合体合作中，如何合理分配利润和风险，确保各方利益均衡且项目顺利推进？",
-                    "面对日益严格的环保要求，EPC总承包项目如何实现绿色施工与成本效益的双赢？"
-                ]
-                import random
-                question = random.choice(backup_questions)
-                self.logger.info(f"使用备用热点问题: {question}")
-            else:
+        for attempt in range(max_retries):
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.config.zhipu_model_fast,  # 使用0成本模型（glm-4.7-flash）生成问题
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": system_prompt
+                        },
+                        {
+                            "role": "user",
+                            "content": user_prompt
+                        }
+                    ],
+                    temperature=0.8,
+                    max_tokens=2000,
+                    timeout=Constants.API_CALL_TIMEOUT  # 【v3.6.4修复】添加API调用超时
+                )
+
+                question = response.choices[0].message.content.strip()
+
+                # 【0成本优化V2.1】GLM-4.7-Flash 偶尔返回空响应，需要处理
+                if not question or not question.strip():
+                    self.logger.warning(f"AI返回空响应 (尝试 {attempt + 1}/{max_retries})")
+                    continue
+
                 question = self._validate_question(question)
 
-            self.logger.info(f"生成热点问题: {question}")
-            return question
+                # 【v3.6.7新增】质量评分
+                quality_result = quality_scorer.score_question(question)
+                if quality_result['passed']:
+                    self.logger.info(f"✓ 热点问题质量达标: {quality_result['score']}分")
+                    self.logger.info(f"生成热点问题: {question}")
+                    return question
+                else:
+                    self.logger.warning(f"热点问题质量不达标 (尝试 {attempt + 1}/{max_retries}): {quality_result['score']}分")
+                    self.logger.warning(f"问题: {quality_result['issues']}")
+                    if attempt < max_retries - 1:
+                        self.logger.info("尝试重新生成...")
+                        continue
 
-        except Exception as e:
-            self.logger.error(f"智谱AI调用失败: {str(e)}")
-            # 【0成本优化V2.1】失败时使用备用问题而不是抛出异常
-            backup_questions = [
-                "在EPC总承包项目实施阶段，面对材料价格波动和工期压力的双重挑战，如何通过精细化管理实现成本控制和进度优化的平衡？",
-                "EPC总承包项目在结算阶段常遇到哪些争议问题？如何通过合同管理和证据保全来有效维护自身权益？",
-                "在当前市场环境下，EPC总承包企业如何通过数字化转型提升项目管理效率和风险防控能力？",
-                "EPC项目联合体合作中，如何合理分配利润和风险，确保各方利益均衡且项目顺利推进？",
-                "面对日益严格的环保要求，EPC总承包项目如何实现绿色施工与成本效益的双赢？"
-            ]
-            import random
-            question = random.choice(backup_questions)
-            self.logger.info(f"AI调用失败，使用备用热点问题: {question}")
-            return question
+            except Exception as e:
+                self.logger.error(f"智谱AI调用失败 (尝试 {attempt + 1}/{max_retries}): {str(e)}")
+                if attempt < max_retries - 1:
+                    import time
+                    time.sleep(2)  # 等待2秒后重试
+                    continue
+
+        # 所有重试都失败，使用备用问题列表
+        self.logger.warning("所有AI生成尝试失败，使用备用热点问题")
+        backup_questions = [
+            "在EPC总承包项目实施阶段，面对材料价格波动和工期压力的双重挑战，如何通过精细化管理实现成本控制和进度优化的平衡？",
+            "EPC总承包项目在结算阶段常遇到哪些争议问题？如何通过合同管理和证据保全来有效维护自身权益？",
+            "在当前市场环境下，EPC总承包企业如何通过数字化转型提升项目管理效率和风险防控能力？",
+            "EPC项目联合体合作中，如何合理分配利润和风险，确保各方利益均衡且项目顺利推进？",
+            "面对日益严格的环保要求，EPC总承包项目如何实现绿色施工与成本效益的双赢？"
+        ]
+        import random
+        question = random.choice(backup_questions)
+        self.logger.info(f"使用备用热点问题: {question}")
+        return question
 
     def _build_context(self, articles: List[Dict]) -> str:
         """构建分析上下文（包含标题、优化摘要、关键词、分类、情感）"""
@@ -4757,7 +5430,7 @@ class ZhipuAIAnalyzer:
         return question
 
     @cached(ttl=43200, max_size=200)  # Cache for 12 hours (优化：延长缓存时间减少API调用)
-    def generate_catchy_title(self, question: str, answer: str) -> str:
+    def generate_catchy_title(self, question: str, answer: str, keyword: str = None) -> str:
         """
         根据热点问题凝练生成10万+自媒体风格标题
 
@@ -4765,10 +5438,12 @@ class ZhipuAIAnalyzer:
         1. 深度分析热点问题中的具体场景和痛点
         2. 提取文章中的核心观点和关键数字
         3. 运用十大10万+标题公式生成爆款标题
+        4. 标题必须包含搜索关键词（如果提供）
 
         Args:
             question: 热点问题（已包含具体场景描述）
             answer: AI生成的回答
+            keyword: 搜索关键词（标题必须包含此关键词）
 
         Returns:
             str: 生成的10万+风格标题
@@ -4836,6 +5511,13 @@ class ZhipuAIAnalyzer:
             "EPC总承包质量验收5个常见问题！一定要提前预防"
         ]
 
+        # 构建关键词要求（如果有搜索关键词）
+        keyword_requirement = ""
+        if keyword:
+            keyword_requirement = f"""
+【关键词强制要求】
+标题必须包含搜索关键词「{keyword}」，这是文章的核心主题，不能遗漏！"""
+
         try:
             response = self.client.chat.completions.create(
                 model=self.config.zhipu_model_title,  # 【0成本优化】使用免费模型 + 优化提示词生成爆款标题
@@ -4846,11 +5528,16 @@ class ZhipuAIAnalyzer:
                     },
                     {
                         "role": "user",
-                        "content": self.config.prompt_title_user.format(question=question, content=content_for_analysis)
+                        "content": self.config.prompt_title_user.format(
+                            question=question,
+                            content=content_for_analysis,
+                            keyword_requirement=keyword_requirement
+                        )
                     }
                 ],
                 temperature=0.9,
-                max_tokens=60  # 增加token以支持更长的标题（最多30汉字）
+                max_tokens=60,  # 增加token以支持更长的标题（最多30汉字）
+                timeout=Constants.API_CALL_TIMEOUT  # 【v3.6.4修复】添加API调用超时
             )
 
             title = response.choices[0].message.content.strip()
@@ -4942,7 +5629,8 @@ class ZhipuAIAnalyzer:
                             }
                         ],
                         temperature=0.7,
-                        max_tokens=50
+                        max_tokens=50,
+                        timeout=Constants.API_CALL_TIMEOUT  # 【v3.6.4修复】添加API调用超时
                     )
 
                     retry_title = retry_response.choices[0].message.content.strip()
@@ -4975,6 +5663,29 @@ class ZhipuAIAnalyzer:
             if not self._validate_title_relevance(title, question):
                 self.logger.warning(f"标题与问题相关性不足，使用备用模板")
                 title = random.choice(title_templates)
+
+            # 【关键词验证】确保标题包含搜索关键词
+            if keyword and keyword not in title:
+                self.logger.warning(f"标题不包含搜索关键词「{keyword}」，尝试添加")
+                # 尝试在标题中添加关键词（智能添加，避免重复）
+                # 计算添加关键词后的长度
+                new_title_with_keyword = f"{keyword}{title}"
+                if len(new_title_with_keyword) <= 30:
+                    # 如果添加关键词后不超过30字，添加关键词
+                    title = new_title_with_keyword
+                    self.logger.info(f"✓ 已添加关键词「{keyword}」，新标题: {title}")
+                else:
+                    # 标题太长无法直接添加，尝试替换通用词
+                    # 如果标题包含"EPC项目"而关键词更具体，尝试替换
+                    if 'EPC项目' in title and keyword not in ['EPC', 'EPC总承包']:
+                        new_title = title.replace('EPC项目', f'{keyword}项目', 1)
+                        if len(new_title) <= 30:
+                            title = new_title
+                            self.logger.info(f"✓ 已替换通用词为关键词，新标题: {title}")
+                        else:
+                            self.logger.warning(f"⚠ 标题无法添加关键词「{keyword}」且不超30字，保持原标题")
+                    else:
+                        self.logger.warning(f"⚠ 标题无法添加关键词「{keyword}」且不超30字，保持原标题")
 
             self.logger.info(f"✓ 最终标题: {title} (长度: {len(title)}字)")
             return title
@@ -5083,7 +5794,8 @@ class ZhipuAIAnalyzer:
                     }
                 ],
                 temperature=0.8,
-                max_tokens=500
+                max_tokens=500,
+                timeout=Constants.API_CALL_TIMEOUT  # 【v3.6.4修复】添加API调用超时
             )
 
             image_prompt = response.choices[0].message.content.strip()
@@ -5277,6 +5989,34 @@ class MetasoAutomation:
             self.logger.warning(f"浏览器健康检查失败: {str(e)}")
             return False
 
+    async def close(self) -> None:
+        """
+        关闭浏览器并保存 metaso.cn 登录状态
+
+        【v3.6.9 重大修复】
+        1. 只保存 metaso.cn 域名的 cookies（防止 sogou.com cookies 污染）
+        2. 添加超时保护
+        3. 强制清理资源
+        """
+        if self.browser:
+            try:
+                # 【v3.6.9 关键修复】只保存 metaso.cn cookies
+                # 使用 cookie_domain_filter 确保只保存正确的域名
+                await self.browser.close(save_cookies=True, cookie_domain_filter="metaso.cn")
+                self.logger.info("✓ MetasoAutomation 浏览器已关闭，metaso.cn cookies 已保存")
+            except Exception as e:
+                self.logger.warning(f"关闭浏览器时出错: {str(e)}")
+                # 即使出错也尝试清理
+                try:
+                    if hasattr(self.browser, 'context') and self.browser.context:
+                        await self.browser.context.close()
+                    if hasattr(self.browser, 'browser') and self.browser.browser:
+                        await self.browser.browser.close()
+                except Exception:
+                    pass
+            finally:
+                self.browser = None
+
     async def _restart_browser(self) -> bool:
         """
         重启浏览器（稳定性优化）
@@ -5293,9 +6033,10 @@ class MetasoAutomation:
         self.logger.info(f"正在重启浏览器... (第{self._browser_restart_count}次)")
 
         # 关闭旧浏览器
+        # 【v3.6.9】重启前只保存 metaso.cn cookies（防止 sogou.com 污染）
         if self.browser:
             try:
-                await self.browser.close()
+                await self.browser.close(save_cookies=True, cookie_domain_filter="metaso.cn")
             except Exception as e:
                 self.logger.debug(f"关闭旧浏览器时出错: {str(e)}")
 
@@ -5356,7 +6097,8 @@ class MetasoAutomation:
                     self.logger.info("需要扫码登录，请用户扫码...")
                     if not await self._wait_for_login():
                         self.logger.error("用户登录超时或失败")
-                        await self.browser.close()
+                        # 【v3.6.8】登录失败时不保存 cookies（没有有效的登录状态）
+                        await self.browser.close(save_cookies=False)
                         continue
 
                 # 如果提供了回复人设提示词，先设置回复人设
@@ -5374,13 +6116,15 @@ class MetasoAutomation:
                 # 等待并获取回答
                 answer = await self._wait_for_answer()
 
-                await self.browser.close()
+                # 【v3.6.8】显式保存 metaso.cn cookies
+                await self.browser.close(save_cookies=True)
 
             except Exception as e:
                 self.logger.error(f"获取回答失败: {str(e)}")
                 if self.browser:
                     try:
-                        await self.browser.close()
+                        # 【v3.6.8】异常时也尝试保存 cookies
+                        await self.browser.close(save_cookies=True)
                     except (Exception,):
                         pass
                 continue
@@ -5443,8 +6187,8 @@ class MetasoAutomation:
                         # 尝试刷新页面
                         try:
                             await self.browser.page.reload(wait_until='domcontentloaded', timeout=30000)
-                        except:
-                            pass
+                        except (asyncio.TimeoutError, Exception) as e:
+                            self.logger.debug(f"页面刷新失败: {str(e)}")
 
             # ===== Step 1: 查找并点击设置按钮（带重试） =====
             max_retry = 3
@@ -5465,8 +6209,8 @@ class MetasoAutomation:
                     try:
                         await self.browser.page.reload(wait_until='domcontentloaded', timeout=30000)
                         await asyncio.sleep(3)
-                    except:
-                        pass
+                    except (asyncio.TimeoutError, Exception) as reload_err:
+                        self.logger.debug(f"页面刷新失败: {reload_err}")
 
             if not settings_clicked:
                 self.logger.error("未能点击设置按钮")
@@ -5855,8 +6599,8 @@ class MetasoAutomation:
                 if success:
                     self.logger.info("  [OK] 通过AI点击'回复人设'标签")
                     return True
-            except:
-                pass
+            except (asyncio.TimeoutError, Exception) as ai_err:
+                self.logger.debug(f"AI辅助点击失败: {ai_err}")
 
             return False
 
@@ -6166,20 +6910,142 @@ class MetasoAutomation:
             try:
                 await self.browser.page.keyboard.press('Escape')
                 await asyncio.sleep(0.5)
-            except:
-                pass
+            except (asyncio.TimeoutError, Exception) as escape_err:
+                self.logger.debug(f"按Escape键关闭失败: {escape_err}")
             return False
 
     async def _navigate_to_metaso(self):
-        """导航到总包大脑页面"""
+        """导航到总包大脑页面
+
+        【v3.6.7优化】localStorage 加载时机修复
+        - 先在 about:blank 页面加载 localStorage
+        - 然后导航到目标页面，这样页面脚本可以读取到 localStorage
+        """
         self.logger.info(f"访问总包大脑: {self.config.metaso_url}")
         try:
+            # 【v3.6.7修复】先加载 localStorage 到 about:blank
+            # 这样导航到目标页面时，页面脚本可以读取到已设置的 localStorage
+            storage_file = Path(self.config.user_data_dir) / "local_storage.json"
+            if storage_file.exists():
+                self.logger.info("预加载 localStorage...")
+                try:
+                    # 先导航到空白页
+                    await self.browser.page.goto("about:blank", timeout=10000)
+                    # 加载 localStorage
+                    await self.browser._load_local_storage()
+                    self.logger.info("✓ localStorage 预加载完成")
+                except Exception as e:
+                    self.logger.warning(f"预加载 localStorage 失败: {e}")
+
+            # 然后导航到目标页面
             await self.browser.goto(self.config.metaso_url, wait_until="domcontentloaded", timeout=60000)
-            await asyncio.sleep(5)
+            await asyncio.sleep(3)
+
+            # 【v3.6.7新增】导航后再次尝试加载 localStorage（确保在正确域名下）
+            try:
+                await self.browser._load_local_storage()
+            except Exception as e:
+                self.logger.debug(f"二次加载 localStorage 失败（可忽略）: {e}")
+
+            await asyncio.sleep(2)
             self.logger.info("页面加载完成")
         except Exception as e:
             self.logger.warning(f"页面加载超时或出错，尝试继续: {str(e)}")
             await asyncio.sleep(3)
+
+    async def _pre_check_login_status(self) -> tuple:
+        """【v3.6.7新增】登录状态预检测
+
+        在定时任务启动前检测登录状态，如果失效则提前通知。
+
+        Returns:
+            tuple: (is_valid: bool, remaining_seconds: int, message: str)
+        """
+        import time as time_module
+
+        cookies_file = Path(self.config.user_data_dir) / "cookies.json"
+
+        # 1. 检查状态文件是否存在
+        if not cookies_file.exists():
+            return (False, 0, "未找到保存的登录状态，需要扫码登录")
+
+        # 2. 检查 cookies 有效期
+        try:
+            import json
+            with open(cookies_file, 'r', encoding='utf-8') as f:
+                cookies = json.load(f)
+
+            now = time_module.time()
+            min_expiry = float('inf')
+            expired_count = 0
+
+            for cookie in cookies:
+                expiry = cookie.get('expires', -1)
+                if expiry > 0:
+                    if expiry < now:
+                        expired_count += 1
+                    else:
+                        min_expiry = min(min_expiry, expiry)
+
+            if expired_count > 0:
+                self.logger.warning(f"发现 {expired_count} 个已过期的 cookie")
+
+            if min_expiry == float('inf'):
+                # 全是会话 cookie，无法确定有效期
+                remaining_seconds = -1
+                message = "登录状态为会话级别，请验证实际状态"
+            else:
+                remaining_seconds = max(0, int(min_expiry - now))
+                if remaining_seconds < 3600:  # 少于1小时
+                    message = f"登录状态即将过期，剩余 {remaining_seconds // 60} 分钟"
+                else:
+                    hours = remaining_seconds // 3600
+                    message = f"登录状态有效，预计剩余 {hours} 小时"
+
+            return (True, remaining_seconds, message)
+
+        except Exception as e:
+            return (False, 0, f"检查登录状态失败: {str(e)}")
+
+    async def _send_login_expiry_warning(self, remaining_seconds: int):
+        """【v3.6.7新增】发送登录即将过期预警"""
+        try:
+            notifier = NotificationManager(self.config, self.logger)
+            minutes = remaining_seconds // 60
+            warning_msg = f"""⚠️ **登录状态预警**
+
+🔐 **总包大脑登录状态即将过期**
+
+⏰ **剩余时间**: 约 {minutes} 分钟
+
+📱 **建议操作**: 请尽快打开浏览器扫码登录，以免影响下次定时任务执行。
+
+---
+_总包大脑自动写作系统 v3.6.8_"""
+            notifier.send_custom_message(warning_msg)
+        except Exception as e:
+            self.logger.warning(f"发送登录预警失败: {e}")
+
+    async def _send_login_required_notification(self):
+        """【v3.6.7新增】发送需要登录通知"""
+        try:
+            notifier = NotificationManager(self.config, self.logger)
+            notify_msg = f"""🔴 **需要扫码登录**
+
+🔐 **总包大脑登录状态已失效**
+
+📱 **操作步骤**:
+1. 打开程序查看浏览器窗口
+2. 使用微信扫描二维码登录
+3. 登录成功后程序将自动继续
+
+⏰ **等待时间**: 最多2分钟
+
+---
+_总包大脑自动写作系统 v3.6.8_"""
+            notifier.send_custom_message(notify_msg)
+        except Exception as e:
+            self.logger.warning(f"发送登录通知失败: {e}")
 
     async def _check_login_required(self) -> bool:
         """使用Stagehand检查是否需要登录"""
@@ -6300,6 +7166,10 @@ class MetasoAutomation:
                 if not await self._check_login_required():
                     self.logger.info("检测到登录成功")
                     await asyncio.sleep(2)
+                    # 【v3.6.4新增】登录成功后立即保存浏览器状态
+                    # 【v3.6.8修复】正确调用 browser 对象的方法
+                    await self.browser._save_storage_state()
+                    self.logger.info("✓ 登录状态已持久化保存")
                     return True
 
                 await asyncio.sleep(check_interval)
@@ -6397,7 +7267,8 @@ class MetasoAutomation:
                             fast_thinking_element = locator
                             self.logger.info(f"找到快思考元素: {selector}")
                             break
-                    except:
+                    except (asyncio.TimeoutError, Exception) as locator_err:
+                        self.logger.debug(f"选择器 {selector} 定位失败: {locator_err}")
                         continue
 
                 if fast_thinking_element:
@@ -6546,7 +7417,8 @@ class MetasoAutomation:
                         self.logger.info(f"✓ 通过直接选择器切换到长思考: {selector}")
                         await asyncio.sleep(1)
                         return True
-                except:
+                except (asyncio.TimeoutError, Exception) as click_err:
+                    self.logger.debug(f"选择器 {selector} 点击失败: {click_err}")
                     continue
 
             self.logger.warning("所有策略均未成功切换到长思考模式，将使用默认模式")
@@ -7026,8 +7898,8 @@ class MetasoAutomation:
                         try:
                             await element.click(timeout=2000)
                             await asyncio.sleep(0.3)
-                        except:
-                            pass
+                        except (asyncio.TimeoutError, Exception) as click_err:
+                            self.logger.debug(f"元素点击失败: {click_err}")
 
                         # 尝试输入
                         if await self._input_and_send(element, question, debug_dir, strategy_name=f"last_resort_{idx+1}"):
@@ -7060,8 +7932,8 @@ class MetasoAutomation:
             try:
                 await self.browser.page.evaluate(method)
                 await asyncio.sleep(0.2)
-            except:
-                pass
+            except (asyncio.TimeoutError, Exception) as scroll_err:
+                self.logger.debug(f"滚动方法 {method} 执行失败: {scroll_err}")
 
     async def _input_and_send(self, element, question: str, debug_dir: str, strategy_name: str = "unknown") -> bool:
         """
@@ -7095,8 +7967,8 @@ class MetasoAutomation:
                 await asyncio.sleep(0.2)
                 await self.browser.page.keyboard.press('Backspace')
                 await asyncio.sleep(0.2)
-            except:
-                pass
+            except (asyncio.TimeoutError, Exception) as clear_err:
+                self.logger.debug(f"清空输入框失败: {clear_err}")
 
             # 尝试多种输入方式
             input_success = False
@@ -7200,7 +8072,8 @@ class MetasoAutomation:
                             await asyncio.sleep(1)
                             self.logger.info(f"✓ 点击发送按钮成功: {selector}")
                             return True
-                except:
+                except (asyncio.TimeoutError, Exception) as btn_err:
+                    self.logger.debug(f"发送按钮选择器 {selector} 失败: {btn_err}")
                     continue
 
             # 方法2: 使用JavaScript查找包含特定文本的按钮
@@ -7257,25 +8130,26 @@ class MetasoAutomation:
                 value = await elem.input_value()
                 if value:
                     return value
-            except:
-                pass
+            except (asyncio.TimeoutError, Exception) as input_err:
+                self.logger.debug(f"获取输入值失败: {input_err}")
 
             try:
                 value = await elem.inner_text()
                 if value:
                     return value
-            except:
-                pass
+            except (asyncio.TimeoutError, Exception) as text_err:
+                self.logger.debug(f"获取内部文本失败: {text_err}")
 
             try:
                 value = await elem.get_attribute('value')
                 if value:
                     return value
-            except:
-                pass
+            except (asyncio.TimeoutError, Exception) as attr_err:
+                self.logger.debug(f"获取value属性失败: {attr_err}")
 
             return ""
-        except:
+        except (asyncio.TimeoutError, Exception) as e:
+            self.logger.debug(f"获取元素内容失败: {e}")
             return ""
 
     async def _get_answer_from_metaso(self, question: str, max_retries: int = 3) -> str:
@@ -8767,7 +9641,8 @@ class MarkdownToWeChat:
                         {"role": "user", "content": enhanced_user}
                     ],
                     temperature=0.1,  # 降低温度，减少创造性修改
-                    max_tokens=10000
+                    max_tokens=10000,
+                    timeout=Constants.API_CALL_TIMEOUT  # 【v3.6.4修复】添加API调用超时
                 )
 
                 structured_content = response.choices[0].message.content.strip()
@@ -9731,7 +10606,8 @@ H3（三级标题）：
                         }
                     ],
                     temperature=0.2,  # 降低随机性，保证风格稳定
-                    max_tokens=16000  # 高质量模型使用更大的token限制
+                    max_tokens=16000,  # 高质量模型使用更大的token限制
+                    timeout=Constants.API_STREAM_TIMEOUT  # 【v3.6.4修复】HTML生成使用更长的超时时间
                 )
 
                 html_content = response.choices[0].message.content.strip()
@@ -10335,7 +11211,8 @@ class ZBBrainArticleTask:
                     if response.status_code == 200:
                         current_ip = response.text.strip()
                         break
-                except:
+                except (requests.exceptions.RequestException, requests.exceptions.Timeout) as ip_err:
+                    self.logger.debug(f"IP服务 {service} 查询失败: {ip_err}")
                     continue
 
             if not current_ip:
@@ -10515,7 +11392,7 @@ class ZBBrainArticleTask:
 
                 # 步骤4.6: 使用智谱AI生成爆款标题
                 self.logger.info("步骤4.6: 使用智谱AI生成爆款标题")
-                catchy_title = ai_analyzer.generate_catchy_title(question, answer)
+                catchy_title = ai_analyzer.generate_catchy_title(question, answer, keyword=keyword)
                 self.logger.info(f"生成爆款标题: {catchy_title} (长度: {len(catchy_title)}字)")
 
                 # 步骤4: 转换并直接创建草稿（使用改进的md2wechat工作流）
@@ -10698,7 +11575,7 @@ def main():
 
     # 输出配置信息
     logger.info("=" * 60)
-    logger.info("ZBBrain-Write v3.6.0 (Zero-Cost AI Edition)")
+    logger.info("ZBBrain-Write v3.6.9 (Cookie Domain Isolation)")
     logger.info("=" * 60)
 
     # 【0成本优化 V2.0】显示模型配置和成本优化状态
@@ -10880,7 +11757,7 @@ def run_scheduler(config: Config, logger: Logger, keyword: str, max_pages: int,
                 # 将标题转为拼音或ASCII，如果编码失败则用占位符
                 try:
                     print(f"Article: {title}", flush=True)
-                except:
+                except UnicodeEncodeError:
                     print(f"Article: [Chinese Title]", flush=True)
                 print(f"Keyword: {keyword}", flush=True)
                 print(f"Stats: Total {self.total_runs} | Success {self.success_runs} | Failed {self.failed_runs}", flush=True)
@@ -11089,6 +11966,53 @@ _总包大脑自动写作系统 v3.5.0_"""
 
                     # IP检查通过，重置标志
                     ip_check_failed = False
+
+                    # ========================================
+                    # 【v3.6.7新增】登录状态预检测
+                    # ========================================
+                    logger.info("=" * 60)
+                    logger.info("🔐 登录状态预检测")
+                    logger.info("=" * 60)
+
+                    try:
+                        # 创建临时的 MetasoAutomation 实例来检测登录状态
+                        temp_metaso = MetasoAutomation(config, logger)
+                        # 使用 asyncio.run() 来调用异步方法
+                        import asyncio
+                        loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(loop)
+                        try:
+                            is_login_valid, remaining_seconds, login_message = loop.run_until_complete(
+                                temp_metaso._pre_check_login_status()
+                            )
+
+                            if is_login_valid:
+                                if remaining_seconds > 0:
+                                    hours_remaining = remaining_seconds // 3600
+                                    logger.info(f"✓ 登录状态有效，剩余约 {hours_remaining} 小时")
+
+                                    # 如果即将过期（少于2小时），发送预警
+                                    if remaining_seconds < 7200:
+                                        logger.warning(f"⚠️ 登录状态即将过期，剩余 {remaining_seconds // 60} 分钟")
+                                        loop.run_until_complete(
+                                            temp_metaso._send_login_expiry_warning(remaining_seconds)
+                                        )
+                                else:
+                                    logger.info("✓ 登录状态为会话级别，将验证实际状态")
+                            else:
+                                logger.warning(f"⚠️ 登录状态检测失败: {login_message}")
+                                # 发送登录提醒通知
+                                loop.run_until_complete(
+                                    temp_metaso._send_login_required_notification()
+                                )
+                        finally:
+                            loop.close()
+                    except Exception as e:
+                        logger.warning(f"登录预检测失败（可忽略）: {e}")
+                    except Exception as e:
+                        logger.warning(f"登录预检测失败（可忽略）: {e}")
+
+                    logger.info("=" * 60)
 
                     # 执行任务
                     success = task.run(keyword, max_pages, mode, user_question, send_email)
