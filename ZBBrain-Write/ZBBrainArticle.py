@@ -212,6 +212,31 @@ class ContentQualityScorer:
         '风险', '管理', '进度', '采购', '监理', '审计'
     ]
 
+    # 【v3.6.12新增】具体业务场景词（用于检测问题是否针对具体场景）
+    SPECIFIC_SCENE_WORDS = [
+        # 投标阶段
+        '不平衡报价', '联合体投标', '投标保函', '投标保证金', '投标截止', '中标通知',
+        '标书编制', '技术方案', '商务报价', '评标', '废标', '投标报价', '工程量计算',
+        '招标文件', '投标策略', '报价策略', '风险准备金', '技术经济分析',
+        # 设计阶段
+        '设计变更', '设计优化', '设计审查', '设计进度', '设计方案', '设计确认',
+        '图纸会审', '技术交底', '深化设计', '变更指令', '功能性变更',
+        # 施工阶段
+        '分包商', '材料价格', '施工质量', '施工进度', '竣工验收', '隐蔽工程',
+        '现场签证', '工程量确认', '施工组织', '安全文明', '分包违约', '工期延误',
+        '人员不足', '质量不达标', '过程监管', '成本控制', '进度优化',
+        # 竣工阶段
+        '结算审计', '质保金', '竣工资料', '决算', '尾款', '保修期',
+        '工程量核减', '变更签证', '审核进度',
+        # 合同与索赔
+        '索赔', '违约', '费用增加', '合同条款', '变更指令', '违约责任',
+        '不可抗力', '风险分担', '利益分配', '争议解决', '预防性条款',
+        '证据保全', '合法权益', '合理索赔', '合同约定',
+        # 通用关键词
+        '风险费', '工程量', '价格取定', '成本控制', '投标阶段', '设计阶段',
+        '施工阶段', '竣工阶段', '合同管理', '项目管理'
+    ]
+
     # 专业性关键词
     PROFESSIONAL_WORDS = [
         '合同', '风险', '管理', '控制', '流程', '规范', '标准',
@@ -242,6 +267,8 @@ class ContentQualityScorer:
 
         Returns:
             dict: 包含score（分数）、issues（问题列表）、passed（是否通过）
+
+        【v3.6.12优化】提高对具体场景和字数的检测标准
         """
         if not question:
             return {'score': 0, 'issues': ['问题为空'], 'passed': False}
@@ -250,36 +277,50 @@ class ContentQualityScorer:
         issues = []
         max_score = 100
 
-        # 1. 长度检查 (40分)
-        if len(question) >= 50:
+        # 1. 长度检查 (40分) - 【v3.6.12优化】提高要求
+        if len(question) >= 80:  # 优秀：80字以上
             score += 40
-        elif len(question) >= 30:
+        elif len(question) >= 60:  # 良好：60-80字
+            score += 35
+            issues.append(f"问题长度({len(question)}字)建议80字以上")
+        elif len(question) >= 50:  # 及格：50-60字
             score += 25
-            issues.append(f"问题长度({len(question)}字)不足50字")
+            issues.append(f"问题长度({len(question)}字)刚达50字最低要求，建议更详细")
         else:
-            score += 10
-            issues.append(f"问题长度({len(question)}字)严重不足")
+            score += 0
+            issues.append(f"问题长度({len(question)}字)不足50字最低要求")
 
-        # 2. 场景词检查 (30分)
+        # 2. 基础场景词检查 (15分)
         scene_count = sum(1 for w in self.SCENE_WORDS if w in question)
         if scene_count >= 2:
-            score += 30
+            score += 15
         elif scene_count == 1:
-            score += 15
+            score += 8
         else:
-            issues.append("缺少场景关键词")
+            issues.append("缺少基础场景关键词（EPC/总承包/设计/施工等）")
 
-        # 3. 问句格式检查 (30分)
-        # 问号结尾 (15分)
+        # 3. 【v3.6.12新增】具体业务场景词检查 (25分)
+        specific_scene_count = sum(1 for w in self.SPECIFIC_SCENE_WORDS if w in question)
+        if specific_scene_count >= 3:
+            score += 25  # 优秀：包含3个以上具体场景词
+        elif specific_scene_count == 2:
+            score += 20  # 良好：包含2个具体场景词
+        elif specific_scene_count == 1:
+            score += 10  # 及格：包含1个具体场景词
+        else:
+            issues.append("缺少具体业务场景词（如：设计变更、分包违约、索赔争议等）")
+
+        # 4. 问句格式检查 (20分)
+        # 问号结尾 (10分)
         if question.endswith('？') or question.endswith('?'):
-            score += 15
+            score += 10
         else:
             issues.append("问题应以问号结尾")
 
-        # 疑问词 (15分)
+        # 疑问词 (10分)
         question_words = ['如何', '怎样', '为什么', '什么', '哪些', '怎么', '能否', '是否']
         if any(w in question for w in question_words):
-            score += 15
+            score += 10
         else:
             issues.append("缺少疑问词（如何/怎样/为什么等）")
 
@@ -298,6 +339,7 @@ class ContentQualityScorer:
             'details': {
                 'length': len(question),
                 'scene_words_count': scene_count,
+                'specific_scene_count': specific_scene_count,
                 'has_question_mark': question.endswith('？') or question.endswith('?')
             }
         }
@@ -5317,12 +5359,13 @@ class ZhipuAIAnalyzer:
 
         # 所有重试都失败，使用备用问题列表
         self.logger.warning("所有AI生成尝试失败，使用备用热点问题")
+        # 【v3.6.12优化】备用问题列表 - 更加具体详细，每个问题80字以上
         backup_questions = [
-            "在EPC总承包项目实施阶段，面对材料价格波动和工期压力的双重挑战，如何通过精细化管理实现成本控制和进度优化的平衡？",
-            "EPC总承包项目在结算阶段常遇到哪些争议问题？如何通过合同管理和证据保全来有效维护自身权益？",
-            "在当前市场环境下，EPC总承包企业如何通过数字化转型提升项目管理效率和风险防控能力？",
-            "EPC项目联合体合作中，如何合理分配利润和风险，确保各方利益均衡且项目顺利推进？",
-            "面对日益严格的环保要求，EPC总承包项目如何实现绿色施工与成本效益的双赢？"
+            "在EPC总承包项目的设计变更管理过程中，当业主频繁提出功能性变更需求且拒绝承担由此产生的工期延误和成本增加费用时，总承包商应如何通过合同条款约定和现场证据保全来有效维护自身的合法权益并实现合理索赔？",
+            "EPC总承包项目在分包商选择和管理过程中，面对分包商工期延误、质量不达标、人员不足等多重违约风险，总承包商应如何在合同中设置预防性条款和违约责任，以及在执行过程中如何进行有效监管和及时止损？",
+            "在EPC项目投标报价阶段，面对招标文件中的技术参数模糊、工程量清单不完整、合同条款存在明显陷阱等情况，投标团队应如何通过技术经济分析识别潜在风险，并在报价中合理预留风险准备金以避免中标后亏损？",
+            "EPC总承包项目在竣工验收和结算审计阶段，面对审计单位大幅核减工程量、不认可变更签证、拖延审核进度等问题时，总承包商应如何通过完善的竣工资料编制、规范的变更签证流程和有效的沟通协调来维护自身合法权益？",
+            "在EPC项目联合体合作模式下，面对联合体成员之间利润分配不均、风险承担比例失衡、决策机制不明确等问题时，牵头方应如何通过联合体协议的合理设计和日常管理的有效协调来确保项目顺利推进和各方利益均衡？"
         ]
         import random
         question = random.choice(backup_questions)
@@ -5419,8 +5462,8 @@ class ZhipuAIAnalyzer:
 
         if len(question) < 50:
             self.logger.warning(f"生成的问题过短（{len(question)}字），少于50字要求，返回默认问题")
-            # 返回一个符合要求的默认问题（聚焦具体场景）
-            return f"在EPC总承包项目的设计变更频繁发生且费用索赔争议不断的实际场景下，总承包商如何通过合同条款优化和现场证据管理，有效控制变更成本并维护合法权益？"
+            # 【v3.6.12优化】返回更加具体详细的默认问题（聚焦具体场景，80字以上）
+            return f"在EPC总承包项目的设计变更管理过程中，当业主频繁提出功能性变更需求且拒绝承担由此产生的工期延误和成本增加费用时，总承包商应如何通过合同条款约定和现场证据保全来有效维护自身的合法权益并实现合理索赔？"
 
         if 'EPC总承包' not in question and 'epc总承包' not in question.lower():
             self.logger.warning(f"生成的问题不包含'EPC总承包'，添加默认前缀")
@@ -11619,7 +11662,7 @@ def main():
 
     # 输出配置信息
     logger.info("=" * 60)
-    logger.info("ZBBrain-Write v3.6.11 (Title Generation Optimization)")
+    logger.info("ZBBrain-Write v3.6.12 (Hot Question Optimization)")
     logger.info("=" * 60)
 
     # 【0成本优化 V2.0】显示模型配置和成本优化状态
