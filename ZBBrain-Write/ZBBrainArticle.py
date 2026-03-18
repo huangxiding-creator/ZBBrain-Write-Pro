@@ -8462,20 +8462,24 @@ _总包大脑自动写作系统 v3.6.8_"""
         """等待并获取总包大脑的回答
 
         【v3.6.2更新】长思考模式下使用更长的等待时间
+        【v3.6.13优化】增加滚动加载和完整性验证
         """
         # 【v3.6.2】根据是否启用长思考模式调整等待参数
         if self.config.enable_long_thinking:
             # 长思考模式：使用更长的等待时间
             max_wait = max(self.config.max_wait_time, 900)  # 至少15分钟
             min_wait_time = 60  # 最小等待60秒后再开始稳定性检查
-            required_stable_count = 10  # 增加到10次，更保守的判定
+            required_stable_count = 15  # 【v3.6.13】增加到15次，更保守的判定
             self.logger.info(f"等待总包大脑回答（长思考模式），最长等待时间: {max_wait} 秒")
         else:
             # 普通模式：使用默认等待时间
             max_wait = self.config.max_wait_time
-            min_wait_time = 30  # 最小等待30秒后再开始稳定性检查
-            required_stable_count = 6  # 6次稳定性检查
+            min_wait_time = 45  # 【v3.6.13】增加到45秒
+            required_stable_count = 10  # 【v3.6.13】增加到10次
             self.logger.info(f"等待总包大脑回答，最长等待时间: {max_wait} 秒")
+
+        # 【v3.6.13新增】最小回答长度要求（至少500字符才算有效回答）
+        MIN_VALID_ANSWER_LENGTH = 500
 
         start_time = time.time()
         previous_content = ""
@@ -8486,6 +8490,9 @@ _总包大脑自动写作系统 v3.6.8_"""
 
         while time.time() - start_time < max_wait:
             try:
+                # 【v3.6.13新增】在提取内容前先滚动到底部，确保所有内容加载完成
+                await self._scroll_to_bottom()
+
                 current_content = await self._extract_current_answer()
 
                 if current_content:
@@ -8517,12 +8524,27 @@ _总包大脑自动写作系统 v3.6.8_"""
                             stable_count = 0
                             previous_content = current_content
 
-                        # 判定完成条件：内容不再增长 且 内容稳定 且 达到最小长度
+                        # 【v3.6.13优化】判定完成条件：
+                        # 1. 内容不再增长
+                        # 2. 内容稳定
+                        # 3. 达到最小长度（使用更高的阈值）
+                        # 4. 【新增】回答完整性验证
+                        effective_min_length = max(self.config.min_answer_length, MIN_VALID_ANSWER_LENGTH)
+
                         if (content_growth_stopped and
                             stable_count >= required_stable_count and
-                            content_length >= self.config.min_answer_length):
-                            self.logger.info(f"检测到回答完成 - 最终长度: {content_length} 字符")
-                            return current_content
+                            content_length >= effective_min_length):
+
+                            # 【v3.6.13新增】验证回答完整性
+                            if self._is_answer_complete(current_content):
+                                self.logger.info(f"✅ 检测到回答完成 - 最终长度: {content_length} 字符")
+                                return current_content
+                            else:
+                                self.logger.warning(f"⚠️ 回答可能不完整，继续等待... (长度: {content_length})")
+                                # 重置稳定性计数，继续等待
+                                stable_count = 0
+                                content_growth_stopped = False
+                                no_growth_count = 0
                     else:
                         self.logger.debug(f"等待中... ({elapsed_time:.1f}/{min_wait_time} 秒)")
 
@@ -8533,20 +8555,86 @@ _总包大脑自动写作系统 v3.6.8_"""
                 await asyncio.sleep(self.config.check_interval)
 
         # 超时返回当前内容
+        # 【v3.6.13优化】超时前最后尝试滚动并提取
+        await self._scroll_to_bottom()
+        await asyncio.sleep(2)  # 等待2秒让内容加载
+
         final_content = await self._extract_current_answer()
-        if final_content:
+        if final_content and len(final_content) >= MIN_VALID_ANSWER_LENGTH:
             self.logger.warning(f"等待超时，返回当前获取的内容 (长度: {len(final_content)} 字符)")
             return final_content
+        elif final_content:
+            self.logger.error(f"⚠️ 获取的内容长度不足 ({len(final_content)} 字符)，可能不完整")
 
         self.logger.error("等待超时且未获取到任何回答")
         return None
 
+    async def _scroll_to_bottom(self):
+        """【v3.6.13新增】滚动到页面底部，确保所有内容加载完成"""
+        try:
+            # 多次滚动确保加载完整
+            for i in range(3):
+                await self.browser.page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                await asyncio.sleep(0.5)
+                await self.browser.page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                await asyncio.sleep(0.5)
+
+            self.logger.debug("已滚动到页面底部")
+        except Exception as e:
+            self.logger.debug(f"滚动页面失败: {str(e)}")
+
+    def _is_answer_complete(self, answer: str) -> bool:
+        """【v3.6.13新增】验证回答是否完整
+
+        检查回答是否有完整的结尾标志
+        """
+        if not answer or len(answer) < 500:
+            return False
+
+        # 检查是否有完整的结尾标志
+        answer_stripped = answer.strip()
+
+        # 1. 检查是否以完整的句子结尾（句号、感叹号、问号）
+        if answer_stripped[-1] in '。！？.!?':
+            return True
+
+        # 2. 检查是否以常见的结尾词结尾
+        ending_patterns = [
+            '以上', '总之', '综上所述', '总结', '希望能帮助',
+            '供参考', '仅供参考', '建议', '希望对您有帮助',
+            '祝您', '祝工作顺利', '如有疑问'
+        ]
+        for pattern in ending_patterns:
+            if pattern in answer_stripped[-100:]:  # 检查最后100个字符
+                return True
+
+        # 3. 检查是否有结构化内容的完整标志（如列表、段落）
+        # 如果回答包含多个段落或列表项，且最后一个完整，也认为是完整的
+        paragraphs = [p.strip() for p in answer_stripped.split('\n\n') if p.strip()]
+        if len(paragraphs) >= 3:
+            # 检查最后一个段落是否完整
+            last_para = paragraphs[-1]
+            if last_para.endswith('。') or last_para.endswith('！') or last_para.endswith('？'):
+                return True
+            # 如果最后一个段落超过50字且不是以逗号结尾，也认为可能是完整的
+            if len(last_para) >= 50 and not last_para.endswith('，'):
+                return True
+
+        # 4. 如果回答超过2000字，认为可能是完整的（即使没有明确的结尾标志）
+        if len(answer_stripped) >= 2000:
+            return True
+
+        return False
+
     async def _extract_current_answer(self) -> Optional[str]:
-        """使用Stagehand提取当前页面的回答内容"""
+        """使用Stagehand提取当前页面的回答内容
+
+        【v3.6.13优化】增加滚动后重试机制
+        """
         try:
             # 首先尝试直接使用JavaScript获取完整的回答内容
             js_content = await self._extract_answer_with_js()
-            if js_content and len(js_content) > 50:
+            if js_content and len(js_content) > 100:  # 【v3.6.13】提高到100字符
                 return js_content.strip()
 
             # 回退到传统方法
@@ -11662,7 +11750,7 @@ def main():
 
     # 输出配置信息
     logger.info("=" * 60)
-    logger.info("ZBBrain-Write v3.6.12 (Hot Question Optimization)")
+    logger.info("ZBBrain-Write v3.6.13 (Answer Extraction Optimization)")
     logger.info("=" * 60)
 
     # 【0成本优化 V2.0】显示模型配置和成本优化状态
