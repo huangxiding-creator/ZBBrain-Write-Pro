@@ -8570,16 +8570,47 @@ _总包大脑自动写作系统 v3.6.8_"""
         return None
 
     async def _scroll_to_bottom(self):
-        """【v3.6.13新增】滚动到页面底部，确保所有内容加载完成"""
+        """【v3.6.14优化】滚动到页面底部，确保所有内容加载完成
+
+        增强滚动机制：
+        1. 多轮滚动确保触发懒加载
+        2. 检测页面高度变化判断是否加载完成
+        3. 增加等待时间让内容完全渲染
+        """
         try:
-            # 多次滚动确保加载完整
-            for i in range(3):
+            self.logger.debug("开始滚动页面以加载完整内容...")
+
+            # 记录初始页面高度
+            prev_height = await self.browser.page.evaluate("document.body.scrollHeight")
+
+            # 多轮滚动，确保所有内容加载
+            max_scroll_rounds = 5
+            for round_num in range(max_scroll_rounds):
+                # 滚动到底部
                 await self.browser.page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(1)  # 等待1秒让内容加载
+
+                # 再次滚动（有些网站需要多次触发）
                 await self.browser.page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                 await asyncio.sleep(0.5)
 
-            self.logger.debug("已滚动到页面底部")
+                # 检查页面高度是否变化
+                current_height = await self.browser.page.evaluate("document.body.scrollHeight")
+                if current_height == prev_height:
+                    # 页面高度没有变化，可能已经加载完成
+                    if round_num >= 2:  # 至少滚动2轮
+                        self.logger.debug(f"页面高度稳定，内容可能已完整加载 (第{round_num + 1}轮)")
+                        break
+                else:
+                    self.logger.debug(f"页面高度变化: {prev_height} -> {current_height}")
+                    prev_height = current_height
+
+            # 最后再滚动一次确保到底
+            await self.browser.page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            await asyncio.sleep(1)
+
+            self.logger.debug("✅ 页面滚动完成，内容应该已全部加载")
+
         except Exception as e:
             self.logger.debug(f"滚动页面失败: {str(e)}")
 
@@ -8722,9 +8753,152 @@ _总包大脑自动写作系统 v3.6.8_"""
             return None
 
     async def _extract_answer_with_js(self) -> Optional[str]:
-        """使用JavaScript提取回答内容（更可靠的方法）"""
+        """使用JavaScript提取回答内容（更可靠的方法）
+
+        【v3.6.14重构】完全重写提取策略：
+        1. 合并所有回答元素，而不是只获取最后一个
+        2. 智能过滤用户消息和输入框内容
+        3. 支持多种消息结构
+        """
         try:
-            # 多种JavaScript提取策略
+            # 【v3.6.14新增】策略0: 合并所有回答元素 - 最可靠的方法
+            merge_script = """(() => {
+                // 收集所有可能的AI回答元素
+                const allAnswerTexts = [];
+                const seenTexts = new Set(); // 用于去重
+
+                // 1. 查找所有可能的AI消息元素
+                const selectors = [
+                    // Metaso/总包大脑特定的选择器
+                    'div[class*="message"]:not([class*="user"]):not([class*="input"])',
+                    'div[class*="answer"]:not([class*="user"])',
+                    'div[class*="response"]:not([class*="user"])',
+                    'div[class*="reply"]:not([class*="user"])',
+                    'div[class*="assistant"]',
+                    'div[class*="bot-message"]',
+                    'div[class*="ai-message"]',
+                    // Markdown内容
+                    'div.markdown-body',
+                    'div[class*="markdown"]',
+                    'div[class*="prose"]',
+                    // 通用消息容器
+                    '[class*="chat-message"]:not([class*="user"])',
+                    '[class*="msg-content"]:not([class*="user"])',
+                    '[class*="bubble-content"]:not([class*="user"])'
+                ];
+
+                for (const selector of selectors) {
+                    try {
+                        const elements = document.querySelectorAll(selector);
+                        for (const elem of elements) {
+                            // 跳过包含输入框的元素
+                            if (elem.querySelector('textarea, input[type="text"], [contenteditable="true"]')) {
+                                continue;
+                            }
+                            // 跳过太小的元素
+                            const text = (elem.innerText || elem.textContent || '').trim();
+                            if (text.length < 20) continue;
+
+                            // 检查是否是用户消息（包含"用户"、"我"等关键词在开头）
+                            const lowerText = text.toLowerCase();
+                            const classes = (elem.className || '').toLowerCase();
+                            if (classes.includes('user') ||
+                                classes.includes('input') ||
+                                classes.includes('send') ||
+                                classes.includes('textarea')) {
+                                continue;
+                            }
+
+                            // 去重：只添加未见过的文本
+                            const textKey = text.substring(0, 100); // 用前100字符作为key
+                            if (!seenTexts.has(textKey)) {
+                                seenTexts.add(textKey);
+                                allAnswerTexts.push({
+                                    text: text,
+                                    length: text.length,
+                                    top: elem.getBoundingClientRect().top
+                                });
+                            }
+                        }
+                    } catch (e) {}
+                }
+
+                // 2. 如果没有找到特定选择器，尝试通用方法
+                if (allAnswerTexts.length === 0) {
+                    // 查找所有大文本块
+                    const allDivs = document.querySelectorAll('div, article, section');
+                    for (const div of allDivs) {
+                        const text = (div.innerText || div.textContent || '').trim();
+                        if (text.length > 200) {
+                            // 排除输入区域
+                            if (div.querySelector('textarea, input, button[aria-label*="发送"]')) {
+                                continue;
+                            }
+                            const classes = (div.className || '').toLowerCase();
+                            if (classes.includes('input') || classes.includes('user-message')) {
+                                continue;
+                            }
+                            const textKey = text.substring(0, 100);
+                            if (!seenTexts.has(textKey)) {
+                                seenTexts.add(textKey);
+                                allAnswerTexts.push({
+                                    text: text,
+                                    length: text.length,
+                                    top: div.getBoundingClientRect().top
+                                });
+                            }
+                        }
+                    }
+                }
+
+                // 3. 按页面位置排序（从上到下）
+                allAnswerTexts.sort((a, b) => a.top - b.top);
+
+                // 4. 智能合并：去除重复内容，保留最长版本
+                let mergedText = '';
+                let lastEnd = '';
+
+                for (const item of allAnswerTexts) {
+                    const text = item.text;
+                    // 如果这个文本完全包含在上一个文本中，跳过
+                    if (mergedText.includes(text)) continue;
+                    // 如果上一个文本完全包含在这个文本中，替换
+                    if (text.includes(mergedText)) {
+                        mergedText = text;
+                        continue;
+                    }
+                    // 检查是否有重叠部分
+                    const overlapLen = Math.min(50, mergedText.length, text.length);
+                    let hasOverlap = false;
+                    for (let i = overlapLen; i > 0; i--) {
+                        if (mergedText.endsWith(text.substring(0, i))) {
+                            mergedText += text.substring(i);
+                            hasOverlap = true;
+                            break;
+                        }
+                    }
+                    if (!hasOverlap) {
+                        // 没有重叠，直接添加（用换行分隔）
+                        if (mergedText.length > 0) {
+                            mergedText += '\\n\\n' + text;
+                        } else {
+                            mergedText = text;
+                        }
+                    }
+                }
+
+                return mergedText;
+            })()"""
+
+            try:
+                content = await self.browser.page.evaluate(merge_script)
+                if content and len(content.strip()) > 100:
+                    self.logger.info(f"✅ 使用合并策略提取成功，长度: {len(content.strip())} 字符")
+                    return content.strip()
+            except Exception as e:
+                self.logger.debug(f"合并策略提取失败: {str(e)}")
+
+            # 回退策略：原有策略
             js_scripts = [
                 # 策略1: 查找包含assistant/answer/bubble/message的div，获取最后一个
                 """(() => {
@@ -8792,8 +8966,8 @@ _总包大脑自动写作系统 v3.6.8_"""
             for script in js_scripts:
                 try:
                     content = await self.browser.page.evaluate(script)
-                    if content and len(content.strip()) > 50:
-                        self.logger.debug(f"使用JS提取成功，长度: {len(content.strip())} 字符")
+                    if content and len(content.strip()) > 100:
+                        self.logger.debug(f"使用回退策略提取成功，长度: {len(content.strip())} 字符")
                         return content.strip()
                 except (AttributeError, Exception):
                     continue
@@ -11750,7 +11924,7 @@ def main():
 
     # 输出配置信息
     logger.info("=" * 60)
-    logger.info("ZBBrain-Write v3.6.13 (Answer Extraction Optimization)")
+    logger.info("ZBBrain-Write v3.6.14 (Enhanced Answer Extraction)")
     logger.info("=" * 60)
 
     # 【0成本优化 V2.0】显示模型配置和成本优化状态
