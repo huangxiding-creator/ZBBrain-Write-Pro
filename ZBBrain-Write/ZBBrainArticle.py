@@ -15,10 +15,27 @@ ZBBrainArticle - 总包大脑文章自动生成脚本 (Stagehand版本)
 本版本使用 Stagehand 进行所有浏览器自动化操作
 
 作者：AI助手
-版本：2.5.0 (Optimized Edition - Iteration 5)
+版本：3.6.15 (完整回复提取修复版)
 
 优化历史：
-- v2.5.0 (当前版本 - 迭代5):
+- v3.6.15 (当前版本 - 完整回复提取修复):
+  * 完整性标记检测：添加"总包学园"标记检测，确保总包大脑回复完整
+  * 首次检测延迟：长思考模式首次检测改为3分钟，避免检测过早
+  * 二次验证机制：提取完成后再滚动并重新提取，确保无遗漏
+  * 滚动机制增强：多种滚动方式组合，确保触发各种懒加载
+  * 超时重试优化：超时前进行3次滚动提取尝试
+
+- v3.6.14:
+  * 回答提取优化：合并所有回答元素而非只取最后一个
+  * 智能过滤：过滤用户消息和输入框内容
+  * 多轮滚动：确保触发懒加载
+
+- v3.6.13:
+  * 完整性验证：添加_is_answer_complete方法
+  * 滚动加载：每次提取前滚动到底部
+  * 稳定性检查：增加稳定次数要求
+
+- v2.5.0 (迭代5):
   * 监控增强：添加MetricsCollector指标收集系统
   * 监控增强：实现性能、错误、业务和系统指标分类
   * 监控增强：支持指标聚合和摘要统计
@@ -8463,14 +8480,15 @@ _总包大脑自动写作系统 v3.6.8_"""
 
         【v3.6.2更新】长思考模式下使用更长的等待时间
         【v3.6.13优化】增加滚动加载和完整性验证
+        【v3.6.15优化】长思考模式首次检测时间改为3分钟，避免检测过早
         """
-        # 【v3.6.2】根据是否启用长思考模式调整等待参数
+        # 【v3.6.15】根据是否启用长思考模式调整等待参数
         if self.config.enable_long_thinking:
             # 长思考模式：使用更长的等待时间
             max_wait = max(self.config.max_wait_time, 900)  # 至少15分钟
-            min_wait_time = 60  # 最小等待60秒后再开始稳定性检查
+            min_wait_time = 180  # 【v3.6.15】首次检测改为3分钟（180秒），避免检测过早
             required_stable_count = 15  # 【v3.6.13】增加到15次，更保守的判定
-            self.logger.info(f"等待总包大脑回答（长思考模式），最长等待时间: {max_wait} 秒")
+            self.logger.info(f"等待总包大脑回答（长思考模式），首次检测时间: 3分钟，最长等待: {max_wait} 秒")
         else:
             # 普通模式：使用默认等待时间
             max_wait = self.config.max_wait_time
@@ -8537,8 +8555,27 @@ _总包大脑自动写作系统 v3.6.8_"""
 
                             # 【v3.6.13新增】验证回答完整性
                             if self._is_answer_complete(current_content):
-                                self.logger.info(f"✅ 检测到回答完成 - 最终长度: {content_length} 字符")
-                                return current_content
+                                # 【v3.6.15新增】二次验证：滚动后再次提取确保没有遗漏
+                                self.logger.info(f"✅ 检测到回答完成，进行二次验证... 当前长度: {content_length} 字符")
+                                await self._scroll_to_bottom()
+                                await asyncio.sleep(3)  # 等待3秒让内容完全加载
+
+                                # 二次提取验证
+                                verified_content = await self._extract_current_answer()
+                                if verified_content and len(verified_content) >= len(current_content):
+                                    # 二次提取内容没有减少，确认完整
+                                    if self._is_answer_complete(verified_content):
+                                        self.logger.info(f"✅ 二次验证通过 - 最终长度: {len(verified_content)} 字符")
+                                        return verified_content
+                                    else:
+                                        self.logger.warning(f"⚠️ 二次验证：完整性检查未通过，继续等待...")
+                                else:
+                                    self.logger.warning(f"⚠️ 二次验证：内容长度减少或为空，继续等待...")
+
+                                # 重置稳定性计数，继续等待
+                                stable_count = 0
+                                content_growth_stopped = False
+                                no_growth_count = 0
                             else:
                                 self.logger.warning(f"⚠️ 回答可能不完整，继续等待... (长度: {content_length})")
                                 # 重置稳定性计数，继续等待
@@ -8555,30 +8592,49 @@ _总包大脑自动写作系统 v3.6.8_"""
                 await asyncio.sleep(self.config.check_interval)
 
         # 超时返回当前内容
-        # 【v3.6.13优化】超时前最后尝试滚动并提取
-        await self._scroll_to_bottom()
-        await asyncio.sleep(2)  # 等待2秒让内容加载
+        # 【v3.6.15优化】超时前进行多次滚动和提取尝试
+        self.logger.warning("等待超时，进行最后的内容提取尝试...")
 
-        final_content = await self._extract_current_answer()
-        if final_content and len(final_content) >= MIN_VALID_ANSWER_LENGTH:
-            self.logger.warning(f"等待超时，返回当前获取的内容 (长度: {len(final_content)} 字符)")
-            return final_content
-        elif final_content:
-            self.logger.error(f"⚠️ 获取的内容长度不足 ({len(final_content)} 字符)，可能不完整")
+        for attempt in range(3):
+            await self._scroll_to_bottom()
+            await asyncio.sleep(2)
 
-        self.logger.error("等待超时且未获取到任何回答")
+            final_content = await self._extract_current_answer()
+            if final_content and len(final_content) >= MIN_VALID_ANSWER_LENGTH:
+                if self._is_answer_complete(final_content):
+                    self.logger.info(f"✅ 超时后成功提取完整内容 (长度: {len(final_content)} 字符)")
+                    return final_content
+                elif attempt < 2:
+                    self.logger.warning(f"⚠️ 内容可能不完整，重试提取... (尝试 {attempt + 1}/3)")
+                    continue
+                else:
+                    self.logger.warning(f"等待超时，返回当前获取的内容 (长度: {len(final_content)} 字符)")
+                    return final_content
+            elif final_content:
+                self.logger.warning(f"⚠️ 获取的内容长度不足 ({len(final_content)} 字符)，重试... (尝试 {attempt + 1}/3)")
+
+        self.logger.error("等待超时且未获取到任何有效回答")
         return None
 
     async def _scroll_to_bottom(self):
-        """【v3.6.14优化】滚动到页面底部，确保所有内容加载完成
+        """【v3.6.15优化】滚动到页面底部，确保所有内容加载完成
 
         增强滚动机制：
-        1. 多轮滚动确保触发懒加载
-        2. 检测页面高度变化判断是否加载完成
-        3. 增加等待时间让内容完全渲染
+        1. 多种滚动方式组合，确保触发各种懒加载
+        2. 多轮滚动确保触发懒加载
+        3. 检测页面高度变化判断是否加载完成
+        4. 增加等待时间让内容完全渲染
         """
         try:
             self.logger.debug("开始滚动页面以加载完整内容...")
+
+            # 【v3.6.15新增】多种滚动方式
+            scroll_methods = [
+                'window.scrollTo(0, document.body.scrollHeight)',
+                'window.scrollTo(0, document.documentElement.scrollHeight)',
+                'document.body.scrollTop = document.body.scrollHeight',
+                'document.documentElement.scrollTop = document.documentElement.scrollHeight',
+            ]
 
             # 记录初始页面高度
             prev_height = await self.browser.page.evaluate("document.body.scrollHeight")
@@ -8586,13 +8642,15 @@ _总包大脑自动写作系统 v3.6.8_"""
             # 多轮滚动，确保所有内容加载
             max_scroll_rounds = 5
             for round_num in range(max_scroll_rounds):
-                # 滚动到底部
-                await self.browser.page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                await asyncio.sleep(1)  # 等待1秒让内容加载
+                # 【v3.6.15】使用多种滚动方式组合
+                for method in scroll_methods:
+                    try:
+                        await self.browser.page.evaluate(method)
+                        await asyncio.sleep(0.3)
+                    except Exception:
+                        pass
 
-                # 再次滚动（有些网站需要多次触发）
-                await self.browser.page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(1)  # 等待1秒让内容加载
 
                 # 检查页面高度是否变化
                 current_height = await self.browser.page.evaluate("document.body.scrollHeight")
@@ -8606,7 +8664,12 @@ _总包大脑自动写作系统 v3.6.8_"""
                     prev_height = current_height
 
             # 最后再滚动一次确保到底
-            await self.browser.page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            for method in scroll_methods:
+                try:
+                    await self.browser.page.evaluate(method)
+                    await asyncio.sleep(0.2)
+                except Exception:
+                    pass
             await asyncio.sleep(1)
 
             self.logger.debug("✅ 页面滚动完成，内容应该已全部加载")
@@ -8615,15 +8678,25 @@ _总包大脑自动写作系统 v3.6.8_"""
             self.logger.debug(f"滚动页面失败: {str(e)}")
 
     def _is_answer_complete(self, answer: str) -> bool:
-        """【v3.6.13新增】验证回答是否完整
+        """【v3.6.15优化】验证回答是否完整
 
         检查回答是否有完整的结尾标志
+
+        【v3.6.15更新】增加"总包学园"完整性标记检测 - 这是总包大脑回复的特定结尾标记
         """
         if not answer or len(answer) < 500:
             return False
 
         # 检查是否有完整的结尾标志
         answer_stripped = answer.strip()
+
+        # 【v3.6.15新增】0. 最优先检查：总包大脑特定的完整性标记
+        # 总包大脑回复的最后一定包含"总包学园"字样
+        ZONGBAO_MARKERS = ['总包学园', 'epcschool', 'EPCSchool']
+        for marker in ZONGBAO_MARKERS:
+            if marker in answer_stripped:
+                self.logger.info(f"✅ 检测到完整性标记 '{marker}'，回答确认完整")
+                return True
 
         # 1. 检查是否以完整的句子结尾（句号、感叹号、问号）
         if answer_stripped[-1] in '。！？.!?':
