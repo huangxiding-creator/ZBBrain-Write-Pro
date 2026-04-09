@@ -1,0 +1,69 @@
+# ============================================================
+# ZBBrain-Write .gitignore
+# ============================================================
+
+# 敏感配置文件 - 包含API密钥和凭证
+**/config.ini
+config.ini
+ZBBrain-Write/config.ini
+ZBBrain-Write/wechat_accounts.json
+**/wechat_accounts.json
+
+# 日志文件
+*.log
+ZBBrain-Write/zbbrain_article.log
+
+# 临时文件
+ZBBrain-Write/temp/
+*.tmp
+temp/
+
+# 状态文件
+ZBBrain-Write/keyword_rotation.json
+ZBBrain-Write/theme_rotation.json
+ZBBrain-Write/cover_rotation.json
+ZBBrain-Write/service_registry.json
+
+# 浏览器数据
+ZBBrain-Write/browser_data/
+browser_data/
+ZBBrain-Write/browser_data_backup_*/
+browser_data_backup_*/
+
+# 缓存
+ZBBrain-Write/.cache/
+.cache/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# 虚拟环境
+venv/
+ENV/
+env/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+.cursor/
+*.swp
+*.swo
+*~
+
+# 操作系统
+.DS_Store
+Thumbs.db
+
+# 可执行文件
+*.exe
+ZBBrain-Write/md2wechat.exe
+
+# 便携版目录
+ZBBrain-Write/portable/
+
+# 其他
+nul
+*.pdf

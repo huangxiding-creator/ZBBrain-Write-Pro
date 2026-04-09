@@ -1,0 +1,47 @@
+# ZBBrain-Write Python Dependencies
+# EPC总承包微信公众号自动化文章生成工具 - Python依赖包
+# 使用方法: pip install -r requirements.txt
+
+# Web Automation - Browser automation
+playwright>=1.40.0
+stagehand-py>=0.1.0
+
+# HTTP Requests
+requests>=2.31.0
+httpx>=0.25.0
+
+# AI SDK - ZhipuAI (智谱AI)
+zhipuai>=2.0.0
+
+# Configuration
+configparser>=6.0.0
+python-dotenv>=1.0.0
+
+# Logging
+colorlog>=6.8.0
+
+# Email
+secure-smtplib>=0.1.1
+
+# Data Processing
+beautifulsoup4>=4.12.0
+lxml>=4.9.0
+
+# Image Processing
+Pillow>=10.0.0
+
+# Date & Time
+python-dateutil>=2.8.2
+pytz>=2023.3
+
+# Markdown Processing
+markdown>=3.5.0
+
+# Utilities
+tqdm>=4.66.0
+
+# WeChat integration
+wechatpy>=1.8.18
+
+# Browser automation support
+patchright>=0.1.0
